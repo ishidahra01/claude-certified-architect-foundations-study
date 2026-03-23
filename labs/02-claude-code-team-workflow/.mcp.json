@@ -1,0 +1,20 @@
+{
+  "mcpServers": {
+    "customer-db": {
+      "command": "python",
+      "args": ["-m", "mcp_server.customer"],
+      "env": {
+        "DB_CONNECTION_STRING": "${CUSTOMER_DB_URL}",
+        "DB_READ_ONLY": "true"
+      }
+    },
+    "order-service": {
+      "command": "node",
+      "args": ["./mcp-servers/order-service/index.js"],
+      "env": {
+        "ORDER_SERVICE_URL": "${ORDER_SERVICE_URL}",
+        "ORDER_SERVICE_API_KEY": "${ORDER_SERVICE_API_KEY}"
+      }
+    }
+  }
+}

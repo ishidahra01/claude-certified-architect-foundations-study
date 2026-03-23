@@ -2,467 +2,1128 @@
 
 配点: **27%**（最重要ドメイン）
 
-## 1. Agentic Loop の基本設計
+---
 
-### stop_reason による制御
+## Task 1.1: Agentic Loop の設計と実装
 
-Claude API の `stop_reason` は agentic loop の心臓部です。
+### なぜ重要か
+
+Agentic loop は Claude がツールを使って自律的に問題を解くための基本メカニズムです。ループの制御を誤ると、無限ループ・早期終了・会話履歴の破損といった致命的なバグが発生します。試験でも「ループをどこで止めるか」「ツール結果をどう返すか」が頻出です。
+
+### stop_reason ライフサイクル
 
 | stop_reason | 意味 | ループの次アクション |
 |---|---|---|
-| `end_turn` | モデルが処理完了と判断 | ループ終了 |
-| `tool_use` | ツール呼び出しリクエスト | ツール実行 → 結果を返す |
+| `end_turn` | モデルが処理完了と判断 | **ループ終了** |
+| `tool_use` | ツール呼び出しリクエスト | **ツール実行 → 結果を返す** |
 | `max_tokens` | 出力上限到達 | エラー処理 or リトライ |
 | `stop_sequence` | 停止シーケンス検出 | 条件分岐 |
 
-```python
-while True:
-    response = client.messages.create(...)
-    if response.stop_reason == "end_turn":
-        break
-    elif response.stop_reason == "tool_use":
-        tool_results = execute_tools(response.content)
-        messages.append({"role": "assistant", "content": response.content})
-        messages.append({"role": "user", "content": tool_results})
-```
-
-### ループ設計のベストプラクティス
-
-- **無限ループ防止**: 最大ステップ数（例: 10〜20回）を設定する
-- **tool_use ブロックの完全な返却**: `response.content` をそのまま assistant メッセージに追加する（部分的な追加は API エラーの原因）
-- **tool_result の並列返却**: 複数ツールが並列呼び出された場合、全ての結果を1つの user メッセージにまとめて返す
-
-```python
-# 複数ツールの並列呼び出し結果をまとめて返す
-tool_use_blocks = [b for b in response.content if b.type == "tool_use"]
-tool_results = []
-for block in tool_use_blocks:
-    result = execute_tool(block.name, block.input)
-    tool_results.append({
-        "type": "tool_result",
-        "tool_use_id": block.id,
-        "content": result
-    })
-# ★ 全結果を1つの user メッセージにまとめる
-messages.append({"role": "user", "content": tool_results})
-```
-
-## 2. エージェントの分類と設計パターン
-
-### エージェントの4種類
-
-Anthropic のドキュメントでは、エージェントが活用するメモリと行動の種類が定義されています。
-
-#### メモリタイプ
-
-| メモリ種別 | 説明 | 実装例 |
-|---|---|---|
-| **In-context** | 現在の会話コンテキスト内の情報 | messages 配列 |
-| **External** | データベース・ファイルシステムへの永続化 | PostgreSQL, Redis, ファイル |
-| **In-weights** | モデルの学習済みパラメータ (Fine-tuning) | Fine-tuned model |
-| **In-cache** | KV キャッシュによる再利用 | Prompt caching |
-
-#### 行動タイプ
-
-| 行動種別 | 説明 | 例 |
-|---|---|---|
-| **Storage R/W** | データの読み書き | DB操作, ファイルI/O |
-| **Process execution** | プログラム・コマンドの実行 | Terminal, Test runner |
-| **UI interaction** | GUIの操作 | Web browser, Desktop app |
-| **Service calls** | 外部APIの呼び出し | REST API, Web scraping |
-| **Cross-agent** | 他エージェントの生成・呼び出し | Subagent dispatch |
-
-### エージェントアーキテクチャの選択基準
-
-```
-シンプルな質問応答          → 単一エージェント (ツールなし)
-ツール連携が必要            → 単一エージェント + ツール
-複雑なワークフロー          → Orchestrator + Subagent
-独立した並列タスク          → 並列 Subagent (Parallel Dispatch)
-特化型エキスパートが必要    → 専門 Subagent (Router Pattern)
-```
-
-## 3. Orchestrator / Subagent パターン
-
-### 役割分離
-
-```
-Orchestrator (Claude)
-  ├── 全体計画の立案
-  ├── サブエージェントへの委譲判断
-  └── 結果の統合・最終判断
-
-Subagent (Claude)
-  ├── 単一タスクの実行
-  ├── ツール呼び出し
-  └── 結果の返却 (provenance 付き)
-```
-
-### 重要原則: 文脈の明示渡し
-
-サブエージェントは **親の文脈を自動継承しない**。  
-必要な情報は orchestrator が明示的に渡す。
-
-```python
-# NG: 暗黙の文脈継承に依存
-subagent_prompt = "この注文を処理して"
-
-# OK: 必要な文脈を明示渡し
-subagent_prompt = f"""
-顧客ID: {customer_id}
-注文ID: {order_id}
-処理内容: 返金申請
-制約: 閾値 ${REFUND_THRESHOLD} を超える場合はエスカレーション
-"""
-```
-
-### Subagent の実装パターン
+### ✅ 正しい Agentic Loop の実装
 
 ```python
 import anthropic
 
 client = anthropic.Anthropic()
 
-def run_subagent(task: str, context: dict, tools: list) -> dict:
+def run_agentic_loop(messages: list, tools: list, max_iterations: int = 20) -> str:
     """
-    独立したサブエージェントを実行する
+    正しい agentic loop:
+    - stop_reason == "tool_use" → ツール実行して続行
+    - stop_reason == "end_turn" → 正常終了
+    - 安全弁として max_iterations を設定
     """
-    system = """あなたは専門的なサブエージェントです。
-    与えられたタスクのみを実行し、結果を構造化して返してください。"""
-    
-    user_message = f"""
-    ## タスク
-    {task}
-    
-    ## コンテキスト
-    {context}
-    
-    ## 制約
-    - スコープ外の操作は行わない
-    - エラーは詳細に報告する
-    - 結果には情報源を含める
-    """
-    
-    response = client.messages.create(
-        model="claude-opus-4-5",
-        max_tokens=4096,
-        system=system,
-        tools=tools,
-        messages=[{"role": "user", "content": user_message}]
-    )
-    
-    return {
-        "result": response.content,
-        "stop_reason": response.stop_reason,
-        "agent": "subagent",
-        "task": task
-    }
+    for iteration in range(max_iterations):
+        response = client.messages.create(
+            model="claude-opus-4-5",
+            max_tokens=4096,
+            tools=tools,
+            messages=messages,
+        )
+
+        # assistant の応答をそのまま履歴に追加（部分追加はAPIエラーの原因）
+        messages.append({"role": "assistant", "content": response.content})
+
+        if response.stop_reason == "end_turn":
+            # モデルが完了と判断 → 正常終了
+            return extract_text(response.content)
+
+        if response.stop_reason == "tool_use":
+            # 全ての tool_use ブロックを処理して1つの user メッセージにまとめる
+            tool_results = []
+            for block in response.content:
+                if block.type == "tool_use":
+                    result = execute_tool(block.name, block.input)
+                    tool_results.append({
+                        "type": "tool_result",
+                        "tool_use_id": block.id,
+                        "content": result,
+                    })
+            # ★ 複数ツールの結果は必ず1つの user メッセージにまとめる
+            messages.append({"role": "user", "content": tool_results})
+            continue
+
+    # 安全弁発動（通常はここに到達しない）
+    raise RuntimeError(f"Loop did not terminate within {max_iterations} iterations")
 ```
 
-## 4. Hook / Gate による deterministic なガード
-
-### prompt vs hook の使い分け
-
-| 制御方法 | 適した用途 | 例 |
-|---|---|---|
-| **Prompt** | 文体・形式・トーン・ベストプラクティス | "丁寧語で回答して" |
-| **Hook / Gate** | 順序保証・権限・金額閾値 | "認証後でないと refund 不可" |
-| **Tool 内ロジック** | ビジネスルール・データ検証 | "在庫ゼロなら注文不可" |
+### ❌ アンチパターン
 
 ```python
-# Hook パターン: ツール内で deterministic にブロック
-def process_refund(order_id: str, amount: float) -> dict:
-    # ★ Gate: 閾値チェックは prompt ではなく code で担保
-    if amount > REFUND_THRESHOLD:
+# ❌ アンチパターン1: テキスト内容でループ終了を判断する
+response_text = get_text_from_response(response)
+if "完了しました" in response_text:  # 自然言語シグナルに依存 → 不確実
+    break
+
+# ❌ アンチパターン2: イテレーション上限を主要な停止メカニズムにする
+for i in range(5):  # stop_reason を無視して回数だけで制御
+    response = client.messages.create(...)
+    execute_tools_if_any(response)
+# → end_turn を処理しないため、完了後も無駄に API を呼び続ける
+
+# ❌ アンチパターン3: assistant コンテンツを部分的にしか返さない
+text_only = [b for b in response.content if b.type == "text"]
+messages.append({"role": "assistant", "content": text_only})
+# → tool_use ブロックが欠落し API エラー
+
+# ✅ 正しくは stop_reason でのみ制御する
+if response.stop_reason == "end_turn":
+    break
+elif response.stop_reason == "tool_use":
+    # ツール実行して続行
+    ...
+```
+
+### ツール結果を会話履歴に追加する仕組み
+
+```
+Turn 1: user → "注文 #123 の状態を調べて"
+Turn 2: assistant → [text: "調べます", tool_use: {id: "tu_1", name: "lookup_order", input: {order_id: "123"}}]
+Turn 3: user → [tool_result: {tool_use_id: "tu_1", content: "配送中、到着予定: 明日"}]
+Turn 4: assistant → [text: "注文 #123 は配送中で明日到着予定です"] (stop_reason: "end_turn")
+```
+
+---
+
+## Task 1.2: Multi-agent Systems (Coordinator-Subagent)
+
+### なぜ重要か
+
+単一エージェントでは対応困難な複雑タスク（大規模リサーチ、並列専門処理）には Multi-agent が必要です。ただし設計を誤ると、情報の断絶・重複作業・エラー伝播が起きます。**Hub-and-spoke アーキテクチャ**でコーディネーターを中心に据えることが鍵です。
+
+### Hub-and-Spoke アーキテクチャ
+
+```
+                  ┌─────────────────┐
+                  │  Coordinator    │
+                  │  (Hub)          │
+                  │  ・タスク分解    │
+                  │  ・委譲判断      │
+                  │  ・結果統合      │
+                  │  ・エラー処理    │
+                  └────────┬────────┘
+                           │ ALL inter-subagent communication
+              ┌────────────┼────────────┐
+              ▼            ▼            ▼
+        ┌──────────┐ ┌──────────┐ ┌──────────┐
+        │Subagent A│ │Subagent B│ │Subagent C│
+        │(Web検索) │ │(DB照会)  │ │(分析)    │
+        └──────────┘ └──────────┘ └──────────┘
+```
+
+**重要原則**: サブエージェント同士は直接通信しない。必ずコーディネーター経由。
+
+### ✅ Coordinator の実装
+
+```python
+import anthropic
+import json
+
+client = anthropic.Anthropic()
+
+# コーディネーターが使うツール（サブエージェントを呼び出すための Task ツールを含む）
+coordinator_tools = [
+    {
+        "name": "Task",
+        "description": "サブエージェントを起動して専門タスクを委譲する",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "description": {"type": "string", "description": "タスクの説明"},
+                "prompt": {"type": "string", "description": "サブエージェントへの完全な指示"},
+            },
+            "required": ["description", "prompt"],
+        },
+    },
+    {
+        "name": "synthesize_results",
+        "description": "収集した調査結果を統合して最終回答を生成する",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "findings": {"type": "array", "items": {"type": "string"}},
+                "query": {"type": "string"},
+            },
+            "required": ["findings", "query"],
+        },
+    },
+]
+
+def run_coordinator(user_query: str) -> str:
+    """
+    コーディネーターがクエリを分析し、
+    必要なサブエージェントを動的に選択して委譲する。
+    常に全パイプラインを実行するわけではない。
+    """
+    system_prompt = """あなたはリサーチコーディネーターです。
+    
+    役割:
+    - ユーザーのクエリを分析し、必要なサブタスクを特定する
+    - 適切なサブエージェントに委譲する（常に全員に委譲するわけではない）
+    - 全サブエージェント間の通信はあなたを経由する
+    - 結果を統合して最終回答を生成する
+    
+    重要: タスクの範囲が狭すぎると重要情報を見落とす。
+    カバレッジを確保しつつ重複を最小化すること。
+    """
+    
+    messages = [{"role": "user", "content": user_query}]
+    
+    while True:
+        response = client.messages.create(
+            model="claude-opus-4-5",
+            max_tokens=8192,
+            system=system_prompt,
+            tools=coordinator_tools,
+            messages=messages,
+        )
+        
+        messages.append({"role": "assistant", "content": response.content})
+        
+        if response.stop_reason == "end_turn":
+            return extract_text(response.content)
+        
+        if response.stop_reason == "tool_use":
+            tool_results = []
+            for block in response.content:
+                if block.type == "tool_use":
+                    if block.name == "Task":
+                        # サブエージェントを実行
+                        result = run_subagent(block.input["prompt"])
+                        tool_results.append({
+                            "type": "tool_result",
+                            "tool_use_id": block.id,
+                            "content": json.dumps(result, ensure_ascii=False),
+                        })
+                    elif block.name == "synthesize_results":
+                        result = synthesize(block.input["findings"], block.input["query"])
+                        tool_results.append({
+                            "type": "tool_result",
+                            "tool_use_id": block.id,
+                            "content": result,
+                        })
+            messages.append({"role": "user", "content": tool_results})
+```
+
+### ❌ アンチパターン vs ✅ ベストプラクティス
+
+```python
+# ❌ サブエージェント同士が直接通信する
+subagent_a_result = run_subagent_a(query)
+subagent_b_result = run_subagent_b(subagent_a_result)  # A → B 直接連携
+# → コーディネーターが状況を把握できない、エラー処理が困難
+
+# ✅ 全通信をコーディネーター経由にする
+result_a = coordinator_delegates_to(subagent_a, query)
+coordinator_evaluates(result_a)  # ギャップを確認
+result_b = coordinator_delegates_to(subagent_b, refined_query_based_on_a)
+final = coordinator_synthesizes([result_a, result_b])
+
+# ❌ タスク分解が狭すぎる（重要領域を見落とす）
+tasks = [
+    "2020年のデータのみを調べる",  # 前後の文脈が欠落
+]
+
+# ✅ 十分なカバレッジを確保する
+tasks = [
+    "2019〜2021年のトレンド全体を調べ、2020年に焦点を当てる",
+    "2020年の特異な要因（COVID-19等）の影響を分析する",
+]
+```
+
+### 反復的な精緻化ループ
+
+```python
+def coordinator_with_refinement(query: str) -> str:
+    """
+    コーディネーターが合成結果にギャップを発見したら
+    ターゲットを絞った追加調査を委譲する。
+    """
+    initial_findings = delegate_research(query)
+    synthesis = synthesize(initial_findings)
+    
+    # ギャップチェック
+    gaps = identify_gaps(synthesis, query)
+    if gaps:
+        # ギャップを埋めるための追加調査
+        additional = delegate_research(gaps)
+        synthesis = synthesize(initial_findings + additional)
+    
+    return synthesis
+```
+
+---
+
+## Task 1.3: Subagent の起動・コンテキスト渡し・スポーン
+
+### なぜ重要か
+
+サブエージェントは**独立したコンテキスト**で動作します。親（コーディネーター）の会話履歴を自動的に継承しません。必要な情報を明示的に渡さないと、サブエージェントは「何も知らない状態」でタスクを実行することになります。
+
+### Task ツールによるサブエージェント起動
+
+```python
+# コーディネーターが allowedTools に "Task" を含む必要がある
+coordinator_config = {
+    "model": "claude-opus-4-5",
+    "tools": [
+        {"name": "Task", ...},   # ← これがないとサブエージェントを起動できない
+        {"name": "web_search", ...},
+    ],
+}
+```
+
+### ✅ コンテキストの明示渡し
+
+```python
+# ❌ 暗黙の文脈継承に依存（サブエージェントには何も伝わらない）
+bad_prompt = "顧客の問題を調査して"
+
+# ✅ 必要な全コンテキストをプロンプトに含める
+def build_subagent_prompt(
+    prior_findings: list[dict],
+    research_goal: str,
+    quality_criteria: str,
+    scope: str,
+) -> str:
+    prior_context = "\n".join([
+        f"[{f['source']}] {f['content']}"
+        for f in prior_findings
+    ])
+    
+    return f"""## リサーチ目標
+{research_goal}
+
+## 品質基準
+{quality_criteria}
+
+## 調査スコープ
+{scope}
+
+## 前エージェントの調査結果（コンテキスト）
+{prior_context}
+
+## 指示
+上記のコンテキストを踏まえ、スコープ内の未カバー領域を重点的に調査してください。
+手順を指定するのではなく、目標と基準を満たす方法をあなた自身が判断してください。
+"""
+```
+
+### 並列サブエージェントのスポーン
+
+```python
+# ✅ 1回のコーディネーター応答で複数の Task ツールを同時に呼び出す（並列実行）
+# コーディネーターのレスポンスに複数の tool_use ブロックが含まれる形になる
+
+coordinator_system = """
+複数の独立したリサーチタスクがある場合は、
+1回の応答で複数の Task ツールを同時に呼び出して並列実行してください。
+"""
+
+# コーディネーターが生成するレスポンスイメージ:
+parallel_tool_calls = [
+    {
+        "type": "tool_use",
+        "id": "tu_1",
+        "name": "Task",
+        "input": {
+            "description": "北米市場調査",
+            "prompt": build_subagent_prompt(
+                prior_findings=[],
+                research_goal="北米市場でのEV普及率と主要プレイヤーを調査",
+                quality_criteria="2023年以降のデータ、信頼性の高いソース",
+                scope="北米（米国・カナダ・メキシコ）のみ",
+            ),
+        },
+    },
+    {
+        "type": "tool_use",
+        "id": "tu_2",
+        "name": "Task",
+        "input": {
+            "description": "欧州市場調査",
+            "prompt": build_subagent_prompt(
+                prior_findings=[],
+                research_goal="欧州市場でのEV普及率と主要プレイヤーを調査",
+                quality_criteria="2023年以降のデータ、信頼性の高いソース",
+                scope="欧州（EU + 英国）のみ",
+            ),
+        },
+    },
+]
+# → 両タスクは並列実行される
+```
+
+### 構造化データで出典情報を分離する
+
+```python
+# ✅ コンテンツとメタデータ（出典）を構造化して分離する
+subagent_result = {
+    "findings": [
+        {
+            "content": "2023年の全世界EV販売台数は1,400万台に達した",
+            "metadata": {
+                "source_url": "https://iea.org/reports/ev-outlook-2024",
+                "doc_name": "IEA Global EV Outlook 2024",
+                "page_number": 12,
+                "retrieved_at": "2024-06-01",
+            },
+        },
+        {
+            "content": "中国が全世界販売の60%を占める",
+            "metadata": {
+                "source_url": "https://iea.org/reports/ev-outlook-2024",
+                "doc_name": "IEA Global EV Outlook 2024",
+                "page_number": 15,
+                "retrieved_at": "2024-06-01",
+            },
+        },
+    ],
+    "coverage_gaps": ["南米市場のデータが不足"],
+}
+```
+
+### AgentDefinition の設定
+
+```python
+# サブエージェントの設定例（AgentDefinition相当）
+subagent_definition = {
+    "name": "market_research_agent",
+    "description": "特定地域の市場データを調査・分析する専門エージェント",
+    "system_prompt": """あなたは市場調査の専門家です。
+    与えられたスコープ内のデータのみを調査し、
+    全ての発見事項に出典（URL、文書名、ページ番号）を付けてください。
+    スコープ外のトピックには踏み込まないでください。""",
+    "allowed_tools": ["web_search", "read_document"],  # Task は含めない（サブエージェントはサブエージェントを起動しない）
+    "max_tokens": 4096,
+}
+```
+
+---
+
+## Task 1.4: 多ステップワークフローの強制とハンドオフパターン
+
+### なぜ重要か
+
+「返金処理の前に本人確認を必ずする」のような要件を**プロンプトだけで実現しようとすると失敗率がゼロにならない**です。金融・医療・法的な操作では決定論的な強制が必須です。また、エスカレーション時には人間エージェントが会話履歴なしでも対応できる構造化ハンドオフが必要です。
+
+### プログラム的強制 vs プロンプトベースガイダンス
+
+| アプローチ | 失敗率 | 適した用途 |
+|---|---|---|
+| **プロンプト指示** | 非ゼロ（確率的） | トーン・スタイル・ベストプラクティス |
+| **プログラム的ゲート** | ゼロ（決定論的） | 本人確認・金額閾値・権限チェック |
+
+### ✅ プログラム的な前提条件ゲート
+
+```python
+from dataclasses import dataclass
+from typing import Optional
+
+@dataclass
+class CustomerVerification:
+    customer_id: str
+    verified: bool
+    verification_method: str
+
+# グローバルな検証状態（実際はセッション/DBで管理）
+_verified_customers: dict[str, CustomerVerification] = {}
+
+def get_customer(customer_id: str) -> dict:
+    """顧客情報を取得し、検証済みとしてマークする"""
+    customer = fetch_from_db(customer_id)
+    _verified_customers[customer_id] = CustomerVerification(
+        customer_id=customer_id,
+        verified=True,
+        verification_method="database_lookup",
+    )
+    return customer
+
+def process_refund(customer_id: str, order_id: str, amount: float) -> dict:
+    """
+    ★ プログラム的ゲート:
+    get_customer が先に呼ばれていない限り、process_refund はブロックされる。
+    プロンプト指示ではなく、コードで保証する。
+    """
+    # 前提条件チェック（決定論的）
+    if customer_id not in _verified_customers:
         return {
             "isError": True,
-            "error": "ESCALATION_REQUIRED",
-            "message": f"Refund amount ${amount} exceeds threshold. Human review required.",
-            "requires_human": True
+            "error": "PREREQUISITE_NOT_MET",
+            "message": (
+                f"顧客 {customer_id} の本人確認が完了していません。"
+                "先に get_customer を呼び出してください。"
+            ),
+            "required_action": "call_get_customer_first",
         }
-    # 実際の処理
-    return execute_refund(order_id, amount)
+    
+    verification = _verified_customers[customer_id]
+    if not verification.verified:
+        return {
+            "isError": True,
+            "error": "VERIFICATION_FAILED",
+            "message": "顧客の本人確認に失敗しました。",
+        }
+    
+    # ゲートを通過した場合のみ実際の処理
+    return execute_refund(customer_id, order_id, amount)
 ```
 
-### Human-in-the-Loop (HITL) の設計
-
-エージェントが自律的に行動する範囲が広いほど、人間の監視が重要になります。
-
-```python
-class AgentAction:
-    """エージェントのアクション分類"""
-    
-    # 自動実行可能 (reversible かつ低リスク)
-    AUTO_ALLOWED = [
-        "read_data",
-        "search_web",
-        "generate_report",
-    ]
-    
-    # 承認後実行 (irreversible または中リスク)
-    REQUIRES_APPROVAL = [
-        "send_email",
-        "update_customer_data",
-        "create_ticket",
-    ]
-    
-    # 人間のみ実行 (高リスク)
-    HUMAN_ONLY = [
-        "delete_account",
-        "process_large_refund",
-        "modify_permissions",
-    ]
-
-def check_action_permission(action: str, context: dict) -> tuple[str, str]:
-    """
-    アクションの実行権限を確認
-    Returns: ("allow" | "request_approval" | "deny", reason)
-    """
-    if action in AgentAction.HUMAN_ONLY:
-        return "deny", f"Action '{action}' requires human execution"
-    
-    if action in AgentAction.REQUIRES_APPROVAL:
-        return "request_approval", f"Action '{action}' requires human approval"
-    
-    return "allow", "Action is within automated scope"
-```
-
-## 5. 並列委譲 (Parallel Dispatch)
-
-### Task を使った並列化
+### 並列調査と共有コンテキスト
 
 ```python
 import asyncio
 
-async def research_pipeline(query: str):
-    # 並列で複数 subagent に委譲
-    tasks = [
-        web_search_agent(query),
-        doc_analysis_agent(query),
+async def investigate_multi_concern_request(customer_id: str, issues: list[str]) -> dict:
+    """
+    複数の懸念事項を並列で調査し、共有コンテキストで統合する。
+    例: 「請求エラー」「配送遅延」「商品破損」を同時調査
+    """
+    # 各懸念事項を独立したタスクとして並列実行
+    investigation_tasks = [
+        investigate_issue(customer_id, issue)
+        for issue in issues
     ]
-    results = await asyncio.gather(*tasks, return_exceptions=True)
+    results = await asyncio.gather(*investigation_tasks, return_exceptions=True)
     
-    # Partial failure の処理
-    valid_results = []
-    for r in results:
-        if isinstance(r, Exception):
-            valid_results.append({"error": str(r), "source": "unknown"})
-        else:
-            valid_results.append(r)
-    
-    return synthesis_agent(query, valid_results)
+    # 共有コンテキストで統合
+    shared_context = {
+        "customer_id": customer_id,
+        "investigations": [
+            r if not isinstance(r, Exception) else {"error": str(r), "issue": issues[i]}
+            for i, r in enumerate(results)
+        ],
+    }
+    return shared_context
 ```
 
-### 直列 vs 並列の選択基準
-
-```
-直列 (Sequential) が適切な場合:
-  - タスク B がタスク A の結果に依存する
-  - 状態変更が順序に依存する
-  - デバッグ・監査のため実行順序を明確にしたい
-
-並列 (Parallel) が適切な場合:
-  - 各タスクが独立している
-  - 処理時間の短縮が重要
-  - リソースが十分に利用可能
-```
-
-## 6. Escalation の設計
-
-### 自動処理と human review の境界
+### ✅ 構造化ハンドオフサマリー
 
 ```python
-ESCALATION_CRITERIA = {
-    "refund_amount": 500.0,       # 金額閾値
-    "confidence_score": 0.7,      # 信頼度閾値
-    "consecutive_failures": 3,    # 連続失敗回数
-    "sensitive_operation": True,  # 機密操作フラグ
-}
-
-def should_escalate(context: dict) -> bool:
-    return (
-        context.get("amount", 0) > ESCALATION_CRITERIA["refund_amount"]
-        or context.get("confidence", 1.0) < ESCALATION_CRITERIA["confidence_score"]
-        or context.get("failures", 0) >= ESCALATION_CRITERIA["consecutive_failures"]
-    )
+def create_handoff_summary(
+    customer_id: str,
+    conversation_findings: dict,
+    recommended_action: str,
+) -> dict:
+    """
+    人間エージェントが会話履歴なしで対応できるよう、
+    全ての必要情報を構造化サマリーに含める。
+    """
+    return {
+        "handoff_summary": {
+            # 顧客識別情報
+            "customer_id": customer_id,
+            "customer_name": conversation_findings.get("customer_name"),
+            "account_tier": conversation_findings.get("account_tier"),
+            
+            # 根本原因分析
+            "root_cause": conversation_findings.get("root_cause"),
+            "contributing_factors": conversation_findings.get("factors", []),
+            
+            # 財務情報
+            "refund_amount": conversation_findings.get("refund_amount"),
+            "affected_orders": conversation_findings.get("affected_orders", []),
+            
+            # 推奨アクション
+            "recommended_action": recommended_action,
+            "urgency": conversation_findings.get("urgency", "normal"),
+            
+            # 引継ぎ理由
+            "escalation_reason": conversation_findings.get("escalation_reason"),
+            "attempted_resolutions": conversation_findings.get("attempts", []),
+        }
+    }
 ```
 
-## 7. 長時間タスクの設計 (Long-running Agents)
+---
 
-### チェックポイントと中断可能な設計
+## Task 1.5: Agent SDK Hooks によるツール呼び出しインターセプション
 
-長時間実行するエージェントは、途中で中断・再開できるよう設計することが重要です。
+### なぜ重要か
+
+フックは**決定論的な保証**を提供します。プロンプト指示はモデルが従わない可能性がありますが、フックはコードレベルで強制されるため失敗率はゼロです。異なるソースからの異種データ形式の正規化や、ポリシー違反アクションのブロックに不可欠です。
+
+### フック vs プロンプト指示の比較
+
+| | プロンプト指示 | フック |
+|---|---|---|
+| **コンプライアンス** | 確率的（失敗あり） | 決定論的（必ず実行） |
+| **適用タイミング** | モデルが解釈する時 | ツール呼び出しの前後 |
+| **用途** | スタイル・ヒューリスティック | セキュリティ・監査・変換 |
+
+### ✅ PostToolUse フック: 異種データ形式の正規化
+
+```python
+from datetime import datetime, timezone
+
+def post_tool_use_normalizer(tool_name: str, tool_result: dict) -> dict:
+    """
+    複数の MCP ツールから返される異種データ形式を
+    モデルが処理する前に統一形式に正規化する。
+    """
+    normalized = dict(tool_result)
+    
+    # Unix タイムスタンプ → ISO 8601 に変換
+    if "created_at" in normalized and isinstance(normalized["created_at"], (int, float)):
+        ts = normalized["created_at"]
+        normalized["created_at"] = datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
+        normalized["_created_at_original_format"] = "unix_timestamp"
+    
+    # 数値ステータスコード → 意味のある文字列に変換
+    STATUS_MAP = {1: "active", 2: "pending", 3: "suspended", 4: "closed"}
+    if "status" in normalized and isinstance(normalized["status"], int):
+        original = normalized["status"]
+        normalized["status"] = STATUS_MAP.get(original, f"unknown({original})")
+        normalized["_status_original"] = original
+    
+    # 金額: セント単位 → ドル単位に変換（特定ツールのみ）
+    if tool_name in ("legacy_billing_api", "old_payment_gateway"):
+        if "amount_cents" in normalized:
+            normalized["amount_usd"] = normalized.pop("amount_cents") / 100
+    
+    return normalized
+
+
+def execute_tool_with_hooks(tool_name: str, tool_input: dict) -> dict:
+    """フック付きツール実行"""
+    # PreToolUse フック（呼び出し前）
+    tool_input = pre_tool_use_hook(tool_name, tool_input)
+    
+    # 実際のツール実行
+    raw_result = dispatch_tool(tool_name, tool_input)
+    
+    # PostToolUse フック（結果をモデルに返す前）
+    normalized_result = post_tool_use_normalizer(tool_name, raw_result)
+    
+    return normalized_result
+```
+
+### ✅ ツール呼び出しインターセプションフック: ポリシー違反ブロック
+
+```python
+REFUND_AUTO_APPROVE_LIMIT = 500.0  # USD
+
+def pre_tool_use_hook(tool_name: str, tool_input: dict) -> dict:
+    """
+    ツール呼び出しをブロックしてコンプライアンスを強制する。
+    プロンプト指示ではなくコードで保証する（決定論的）。
+    """
+    if tool_name == "process_refund":
+        amount = tool_input.get("amount", 0)
+        
+        if amount > REFUND_AUTO_APPROVE_LIMIT:
+            # ★ ブロックして別ワークフロー（人間エスカレーション）にリダイレクト
+            raise PolicyViolationError(
+                tool_name="process_refund",
+                reason=f"返金額 ${amount} が自動承認上限 ${REFUND_AUTO_APPROVE_LIMIT} を超過",
+                redirect_to="human_escalation_workflow",
+                context={
+                    "amount": amount,
+                    "order_id": tool_input.get("order_id"),
+                    "customer_id": tool_input.get("customer_id"),
+                },
+            )
+    
+    return tool_input  # 変更なしで通過
+
+
+class PolicyViolationError(Exception):
+    def __init__(self, tool_name: str, reason: str, redirect_to: str, context: dict):
+        super().__init__(reason)
+        self.tool_name = tool_name
+        self.reason = reason
+        self.redirect_to = redirect_to
+        self.context = context
+
+
+def execute_tool_with_policy_enforcement(tool_name: str, tool_input: dict) -> dict:
+    try:
+        validated_input = pre_tool_use_hook(tool_name, tool_input)
+        result = dispatch_tool(tool_name, validated_input)
+        return post_tool_use_normalizer(tool_name, result)
+    except PolicyViolationError as e:
+        # ポリシー違反をモデルに通知してリダイレクトを指示
+        return {
+            "isError": True,
+            "error": "POLICY_VIOLATION",
+            "reason": e.reason,
+            "redirect_to": e.redirect_to,
+            "context": e.context,
+            "message": f"このアクションは自動処理できません: {e.reason}",
+        }
+```
+
+### フックの選択基準まとめ
+
+```
+フックを使う場合:
+  ✅ 返金額の上限チェック（決定論的保証が必要）
+  ✅ 異種APIレスポンスの形式統一（正規化）
+  ✅ 監査ログの記録（全ツール呼び出しを漏れなく記録）
+  ✅ レート制限・スロットリング
+
+プロンプト指示で十分な場合:
+  ✅ 回答の言語・トーン
+  ✅ 出力フォーマット（Markdown vs プレーンテキスト）
+  ✅ ベストプラクティスの推奨
+```
+
+---
+
+## Task 1.6: タスク分解戦略
+
+### なぜ重要か
+
+複雑なタスクを適切に分解しないと、モデルの注意が希釈されて品質が低下します。**固定シーケンシャルパイプライン**（プロンプトチェイニング）と**動的適応分解**はそれぞれ適した用途があり、選択を誤るとコストと品質の両方が悪化します。
+
+### パターン比較
+
+| パターン | 適した用途 | 特徴 |
+|---|---|---|
+| **プロンプトチェイニング** | 予測可能な多面的レビュー | 固定ステップ、並列化容易 |
+| **動的適応分解** | オープンエンドな調査 | 発見に基づいてサブタスクを生成 |
+
+### ✅ プロンプトチェイニング: 大規模コードレビュー
+
+```python
+def large_codebase_review(files: list[str]) -> dict:
+    """
+    大規模コードレビューを2パスで実行:
+    1. ファイル別ローカルパス（並列実行可能）
+    2. クロスファイル統合パス（依存関係・アーキテクチャ）
+    
+    なぜ分けるか: 全ファイルを1回に渡すと注意が希釈される
+    """
+    # Pass 1: 各ファイルを独立してレビュー（並列実行）
+    local_reviews = {}
+    for filepath in files:
+        code = read_file(filepath)
+        local_reviews[filepath] = review_single_file(
+            filepath=filepath,
+            code=code,
+            focus="ローカルなバグ・スタイル・セキュリティ問題のみ。他ファイルとの関係は無視。",
+        )
+    
+    # Pass 2: クロスファイル統合パス（Pass 1の結果を全て渡す）
+    integration_review = review_integration(
+        local_reviews=local_reviews,
+        focus=[
+            "モジュール間の依存関係の問題",
+            "アーキテクチャレベルの懸念",
+            "インターフェースの不整合",
+            "重複実装",
+        ],
+    )
+    
+    return {
+        "per_file_issues": local_reviews,
+        "integration_issues": integration_review,
+        "summary": generate_review_summary(local_reviews, integration_review),
+    }
+
+
+def review_single_file(filepath: str, code: str, focus: str) -> dict:
+    response = client.messages.create(
+        model="claude-opus-4-5",
+        max_tokens=2048,
+        messages=[{
+            "role": "user",
+            "content": f"ファイル: {filepath}\n\nフォーカス: {focus}\n\n```\n{code}\n```",
+        }],
+    )
+    return parse_review(response)
+```
+
+### ✅ 動的適応分解: オープンエンドな調査
+
+```python
+def adaptive_investigation(problem_statement: str) -> dict:
+    """
+    オープンエンドな調査の動的分解:
+    1. まず全体構造をマッピング
+    2. 高影響領域を特定
+    3. 発見に基づいて優先化された調査プランを生成
+    4. 依存関係が発見されるたびにプランを適応
+    """
+    # ステップ1: 構造マッピング
+    structure = map_problem_structure(problem_statement)
+    
+    # ステップ2: 高影響領域の特定
+    high_impact_areas = identify_high_impact(structure)
+    
+    # ステップ3: 優先化されたプランを動的生成
+    investigation_plan = create_prioritized_plan(
+        structure=structure,
+        high_impact_areas=high_impact_areas,
+    )
+    
+    results = {}
+    for area in investigation_plan:
+        # 各調査結果に基づいてプランを適応
+        result = investigate_area(area, context=results)
+        results[area["id"]] = result
+        
+        # 新たな依存関係が発見された場合、プランを更新
+        new_dependencies = find_new_dependencies(result, investigation_plan)
+        if new_dependencies:
+            investigation_plan = update_plan(investigation_plan, new_dependencies)
+    
+    return compile_findings(results)
+
+
+def create_prioritized_plan(structure: dict, high_impact_areas: list) -> list:
+    """
+    固定ステップではなく、発見内容に基づいて
+    優先化されたサブタスクリストを動的生成する。
+    """
+    response = client.messages.create(
+        model="claude-opus-4-5",
+        max_tokens=2048,
+        messages=[{
+            "role": "user",
+            "content": f"""
+問題構造: {structure}
+高影響領域: {high_impact_areas}
+
+上記に基づいて、優先化された調査計画を作成してください。
+各サブタスクには: id, description, priority, dependencies を含めてください。
+            """,
+        }],
+    )
+    return parse_investigation_plan(response)
+```
+
+### 分解パターンの選択ガイド
+
+```
+プロンプトチェイニングを選ぶ場合:
+  ✅ ステップが予測可能（コードレビュー、文書要約、翻訳チェック）
+  ✅ 各ステップが独立していて並列化できる
+  ✅ パイプラインが安定していてメンテナンスしやすい
+
+動的適応分解を選ぶ場合:
+  ✅ 何を調べるべきかが事前にわからない（バグ調査、競合分析）
+  ✅ 発見内容が次のステップに影響する
+  ✅ スコープが広く、優先順位付けが必要
+```
+
+---
+
+## Task 1.7: セッション状態・再開・フォーク
+
+### なぜ重要か
+
+長時間実行エージェントや複数の仮説を並列探索するシナリオでは、セッション状態の管理が重要です。**チェックポイント**で途中から再開でき、**フォーク**で共通ベースラインから分岐した複数のアプローチを探索できます。
+
+### チェックポイントベースの状態保存と再開
 
 ```python
 import json
-from datetime import datetime
+import os
+from datetime import datetime, timezone
+from dataclasses import dataclass, asdict
+from typing import Any, Optional
 
-class CheckpointedAgent:
-    """チェックポイント付きエージェント"""
+@dataclass
+class SessionCheckpoint:
+    session_id: str
+    checkpoint_name: str
+    created_at: str
+    messages: list[dict]
+    metadata: dict[str, Any]
+    step_index: int
+    completed_steps: list[str]
+
+
+class SessionManager:
+    """セッション状態の保存・再開・フォーク管理"""
     
-    def __init__(self, task_id: str):
-        self.task_id = task_id
-        self.checkpoint_file = f"/tmp/agent_{task_id}_checkpoint.json"
+    def __init__(self, storage_dir: str = "/tmp/agent_sessions"):
+        self.storage_dir = storage_dir
+        os.makedirs(storage_dir, exist_ok=True)
     
-    def save_checkpoint(self, state: dict):
-        """現在の状態を保存"""
-        checkpoint = {
-            "task_id": self.task_id,
-            "timestamp": datetime.now().isoformat(),
-            "state": state
-        }
-        with open(self.checkpoint_file, "w") as f:
-            json.dump(checkpoint, f)
+    def save_checkpoint(
+        self,
+        session_id: str,
+        checkpoint_name: str,
+        messages: list[dict],
+        metadata: dict,
+        step_index: int,
+        completed_steps: list[str],
+    ) -> str:
+        """現在のセッション状態をチェックポイントとして保存"""
+        checkpoint = SessionCheckpoint(
+            session_id=session_id,
+            checkpoint_name=checkpoint_name,
+            created_at=datetime.now(tz=timezone.utc).isoformat(),
+            messages=messages,
+            metadata=metadata,
+            step_index=step_index,
+            completed_steps=completed_steps,
+        )
+        
+        checkpoint_path = os.path.join(
+            self.storage_dir,
+            f"{session_id}_{checkpoint_name}.json",
+        )
+        with open(checkpoint_path, "w", encoding="utf-8") as f:
+            json.dump(asdict(checkpoint), f, ensure_ascii=False, indent=2)
+        
+        return checkpoint_path
     
-    def load_checkpoint(self) -> dict | None:
-        """保存された状態を復元"""
-        try:
-            with open(self.checkpoint_file) as f:
-                return json.load(f)
-        except FileNotFoundError:
+    def resume_session(
+        self,
+        session_id: str,
+        checkpoint_name: str = "latest",
+    ) -> Optional[SessionCheckpoint]:
+        """名前付きセッションから再開"""
+        if checkpoint_name == "latest":
+            checkpoint_name = self._find_latest_checkpoint(session_id)
+            if not checkpoint_name:
+                return None
+        
+        checkpoint_path = os.path.join(
+            self.storage_dir,
+            f"{session_id}_{checkpoint_name}.json",
+        )
+        
+        if not os.path.exists(checkpoint_path):
             return None
+        
+        with open(checkpoint_path, encoding="utf-8") as f:
+            data = json.load(f)
+        
+        return SessionCheckpoint(**data)
     
-    async def run_with_checkpoints(self, steps: list[callable]):
-        """ステップごとにチェックポイントを保存しながら実行"""
-        checkpoint = self.load_checkpoint()
-        start_step = checkpoint["state"].get("completed_steps", 0) if checkpoint else 0
+    def fork_session(
+        self,
+        source_session_id: str,
+        source_checkpoint: str,
+        fork_name: str,
+    ) -> str:
+        """
+        既存のセッション状態から新しいセッションをフォーク。
+        共通ベースラインから異なるアプローチを並列探索するために使用。
+        """
+        source = self.resume_session(source_session_id, source_checkpoint)
+        if not source:
+            raise ValueError(f"Source checkpoint not found: {source_session_id}/{source_checkpoint}")
         
-        results = checkpoint["state"].get("results", []) if checkpoint else []
+        # フォークされたセッションIDを生成
+        forked_session_id = f"{source_session_id}_fork_{fork_name}"
         
-        for i, step in enumerate(steps[start_step:], start=start_step):
-            try:
-                result = await step()
-                results.append(result)
-                
-                # ステップ完了後にチェックポイント保存
-                self.save_checkpoint({
-                    "completed_steps": i + 1,
-                    "results": results
-                })
-            except Exception as e:
-                self.save_checkpoint({
-                    "completed_steps": i,
-                    "results": results,
-                    "last_error": str(e)
-                })
-                raise
+        # 共通ベースラインの状態でフォークを保存
+        self.save_checkpoint(
+            session_id=forked_session_id,
+            checkpoint_name="initial",
+            messages=list(source.messages),  # コピー（独立したコンテキスト）
+            metadata={
+                **source.metadata,
+                "forked_from": f"{source_session_id}/{source_checkpoint}",
+                "fork_name": fork_name,
+            },
+            step_index=source.step_index,
+            completed_steps=list(source.completed_steps),
+        )
         
-        return results
+        return forked_session_id
+    
+    def _find_latest_checkpoint(self, session_id: str) -> Optional[str]:
+        """セッションの最新チェックポイントを探す"""
+        checkpoints = [
+            f for f in os.listdir(self.storage_dir)
+            if f.startswith(f"{session_id}_") and f.endswith(".json")
+        ]
+        if not checkpoints:
+            return None
+        # タイムスタンプで最新を選択
+        latest = sorted(checkpoints)[-1]
+        return latest.replace(f"{session_id}_", "").replace(".json", "")
 ```
 
-### タイムアウトと再試行の設計
+### ✅ チェックポイント付きエージェント実行
+
+```python
+def run_agent_with_checkpoints(
+    session_id: str,
+    initial_task: str,
+    steps: list[callable],
+    resume_from: Optional[str] = None,
+) -> dict:
+    """
+    チェックポイントを使って長時間エージェントを実行。
+    中断から再開できる。
+    """
+    manager = SessionManager()
+    
+    # 既存セッションから再開、または新規開始
+    checkpoint = manager.resume_session(session_id, resume_from or "latest")
+    
+    if checkpoint:
+        messages = checkpoint.messages
+        start_step = checkpoint.step_index
+        completed = checkpoint.completed_steps
+        print(f"セッション '{session_id}' をチェックポイント '{checkpoint.checkpoint_name}' から再開")
+    else:
+        messages = [{"role": "user", "content": initial_task}]
+        start_step = 0
+        completed = []
+        print(f"セッション '{session_id}' を新規開始")
+    
+    results = {}
+    for i, step_fn in enumerate(steps[start_step:], start=start_step):
+        step_name = step_fn.__name__
+        
+        result, messages = step_fn(messages)
+        results[step_name] = result
+        completed.append(step_name)
+        
+        # ステップ完了後にチェックポイント保存
+        manager.save_checkpoint(
+            session_id=session_id,
+            checkpoint_name=f"after_step_{i}_{step_name}",
+            messages=messages,
+            metadata={"task": initial_task},
+            step_index=i + 1,
+            completed_steps=completed,
+        )
+    
+    return results
+```
+
+### ✅ フォークによる並列アプローチ探索
 
 ```python
 import asyncio
-from typing import TypeVar, Callable, Awaitable
 
-T = TypeVar("T")
-
-async def with_timeout_and_retry(
-    coro_factory: Callable[[], Awaitable[T]],
-    timeout_seconds: float = 30.0,
-    max_retries: int = 3,
-    backoff_base: float = 2.0
-) -> T:
-    """タイムアウトと指数バックオフリトライ"""
-    last_error = None
-    
-    for attempt in range(max_retries):
-        try:
-            return await asyncio.wait_for(
-                coro_factory(),
-                timeout=timeout_seconds
-            )
-        except asyncio.TimeoutError:
-            last_error = TimeoutError(f"Timed out after {timeout_seconds}s")
-        except Exception as e:
-            last_error = e
-        
-        if attempt < max_retries - 1:
-            wait = backoff_base ** attempt
-            await asyncio.sleep(wait)
-    
-    raise last_error
-```
-
-## 8. エージェントの安全性とセキュリティ
-
-### プロンプトインジェクション対策
-
-エージェントは外部データを処理するため、プロンプトインジェクション攻撃に注意が必要です。
-
-```python
-def sanitize_tool_output(output: str) -> str:
+async def explore_divergent_approaches(
+    base_session_id: str,
+    base_checkpoint: str,
+    approaches: list[dict],
+) -> dict:
     """
-    ツール出力からプロンプトインジェクションを防ぐ
-    外部データは必ずサニタイズしてから context に追加する
+    共通ベースラインから複数のアプローチを並列でフォーク探索。
+    例: 同じ初期調査結果から異なる仮説を並列検証。
     """
-    # XML/HTMLタグのエスケープ (誤って命令として解釈されないよう)
-    sanitized = output.replace("<", "&lt;").replace(">", "&gt;")
+    manager = SessionManager()
     
-    # 疑わしいパターンの検出 (ログ記録)
-    suspicious_patterns = [
-        "ignore previous instructions",
-        "disregard your system prompt",
-        "你好", # 言語切り替え試行 (例示)
-    ]
-    for pattern in suspicious_patterns:
-        if pattern.lower() in output.lower():
-            log_security_event(f"Suspicious pattern in tool output: {pattern}")
+    # 各アプローチのフォークセッションを作成
+    fork_ids = []
+    for approach in approaches:
+        fork_id = manager.fork_session(
+            source_session_id=base_session_id,
+            source_checkpoint=base_checkpoint,
+            fork_name=approach["name"],
+        )
+        fork_ids.append((fork_id, approach))
     
-    return sanitized
-
-def build_tool_result_message(tool_id: str, raw_output: str) -> dict:
-    """ツール結果をセーフに構造化する"""
+    # 並列で各フォークを実行
+    async def run_fork(fork_id: str, approach: dict):
+        return await run_approach_async(fork_id, approach)
+    
+    tasks = [run_fork(fid, appr) for fid, appr in fork_ids]
+    fork_results = await asyncio.gather(*tasks, return_exceptions=True)
+    
+    # 結果を比較して最良のアプローチを選択
     return {
-        "type": "tool_result",
-        "tool_use_id": tool_id,
-        "content": [
-            {
-                "type": "text",
-                # ★ 外部データは明示的にデータとしてマーク
-                "text": f"<tool_output>\n{sanitize_tool_output(raw_output)}\n</tool_output>"
-            }
-        ]
+        approach["name"]: result
+        for (_, approach), result in zip(fork_ids, fork_results)
+        if not isinstance(result, Exception)
     }
+
+
+# 使用例: セキュリティ調査で複数の仮説を並列検証
+async def security_investigation():
+    manager = SessionManager()
+    
+    # 初期調査を実行してベースラインチェックポイントを保存
+    base_session = "security_audit_2024"
+    initial_findings = await run_initial_scan(base_session)
+    manager.save_checkpoint(
+        session_id=base_session,
+        checkpoint_name="after_initial_scan",
+        messages=initial_findings["messages"],
+        metadata={"scope": "full_audit"},
+        step_index=1,
+        completed_steps=["initial_scan"],
+    )
+    
+    # 発見された脆弱性カテゴリごとに並列調査をフォーク
+    results = await explore_divergent_approaches(
+        base_session_id=base_session,
+        base_checkpoint="after_initial_scan",
+        approaches=[
+            {"name": "sql_injection", "hypothesis": "SQLインジェクション脆弱性の深掘り"},
+            {"name": "auth_bypass", "hypothesis": "認証バイパスの可能性を調査"},
+            {"name": "data_exposure", "hypothesis": "機密データ露出リスクを評価"},
+        ],
+    )
+    
+    return results
 ```
 
-### 最小権限の原則 (Principle of Least Privilege)
+---
 
-```python
-# エージェントに与えるツールは必要最小限に絞る
-def get_tools_for_role(role: str) -> list[dict]:
-    """役割に応じた最小ツールセット"""
-    TOOL_SETS = {
-        "read_only_agent": [
-            lookup_order_tool,
-            get_customer_tool,
-            search_knowledge_base_tool,
-        ],
-        "support_agent": [
-            lookup_order_tool,
-            get_customer_tool,
-            process_small_refund_tool,   # 小額のみ
-            create_ticket_tool,
-        ],
-        "senior_agent": [
-            lookup_order_tool,
-            get_customer_tool,
-            process_refund_tool,         # 金額制限なし (Gate で担保)
-            escalate_to_human_tool,
-            update_customer_tool,
-        ],
-    }
-    return TOOL_SETS.get(role, TOOL_SETS["read_only_agent"])
-```
+## 試験対策: 重要ポイントまとめ
 
-## 試験で問われやすいパターン
+### Task 1.1 のポイント
+- **ループ終了条件**: `stop_reason == "end_turn"` のみ（テキスト解析・回数制限を主要停止手段にしない）
+- **`response.content` を丸ごと** assistant メッセージに追加する（部分追加は API エラー）
+- 複数ツール結果は**1つの user メッセージ**にまとめる
+- 最大イテレーション数は**セーフティネット**（主要停止手段ではない）
 
-1. **「prompt でのルール指定」vs「hook での強制」** どちらが適切か
-2. **subagent への文脈渡し方** – 明示 vs 暗黙継承
-3. **partial failure 時の処理** – エラーを伝播させるか graceful degradation か
-4. **escalation 基準の設計** – どの条件を deterministic に判断するか
-5. **メモリタイプの選択** – in-context / external / in-cache の使い分け
-6. **直列 vs 並列委譲** – タスクの依存関係に基づく設計判断
-7. **HITL の設計** – どのアクションに人間の承認が必要か
-8. **プロンプトインジェクション対策** – 外部データの安全な処理
+### Task 1.2 のポイント
+- **Hub-and-spoke**: サブエージェント間の直接通信は禁止、必ずコーディネーター経由
+- コーディネーターは**動的に**必要なサブエージェントを選択（常に全パイプライン実行しない）
+- タスク分解が**狭すぎる**と重要領域のカバレッジが欠ける
+- コーディネーターはギャップを評価して**反復的に精緻化**する
+
+### Task 1.3 のポイント
+- コーディネーターが `allowedTools` に **"Task"** を含めないとサブエージェントを起動できない
+- サブエージェントのコンテキストは**プロンプトに明示的に含める**（自動継承なし）
+- **1回の応答**で複数 Task ツールを呼び出すことで並列実行
+- コンテンツとメタデータ（出典URL・ページ番号）を**構造化して分離**する
+
+### Task 1.4 のポイント
+- **プロンプト指示**のコンプライアンスは確率的（失敗率ゼロではない）
+- 金融・医療等の重要操作には**プログラム的ゲート**（コードレベル強制）を使う
+- エスカレーション時のハンドオフには、人間が会話履歴なしで対応できる**構造化サマリー**が必要
+- 複数懸念事項の調査は**並列**で実行して効率化
+
+### Task 1.5 のポイント
+- **PostToolUse フック**: ツール結果をモデルに渡す前に変換（形式統一、エンリッチメント）
+- **PreToolUse フック**: ツール呼び出しをブロックしてポリシーを強制
+- フックはプロンプト指示より**確実**（決定論的）
+- 監査・ログ記録にはフックが最適（漏れなし）
+
+### Task 1.6 のポイント
+- **プロンプトチェイニング**: 予測可能なステップ（コードレビュー等）
+- **動的適応分解**: 発見に基づいてプランが変わるオープンエンド調査
+- 大規模コードレビューは**ファイル別ローカルパス + クロスファイル統合パス**の2段階
+- 全ファイルを一度に渡すと**注意希釈**が起きる
+
+### Task 1.7 のポイント
+- **チェックポイント**: セッションIDと名前でステートを保存・復元
+- **再開**: 名前付きチェックポイントから途中のステップを再開
+- **フォーク**: 共通ベースラインから異なるアプローチを並列探索（独立コンテキスト）
+- フォークされたセッションは親セッションと**独立した状態**を持つ

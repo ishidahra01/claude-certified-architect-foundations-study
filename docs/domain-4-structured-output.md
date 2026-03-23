@@ -2,7 +2,49 @@
 
 配点: **20%**
 
-## 1. JSON schema 設計: nullable vs optional
+## 1. システムプロンプトの設計原則
+
+### 効果的なシステムプロンプトの構造
+
+システムプロンプトはモデルの動作の基盤となります。構造化された記述が重要です。
+
+```python
+system_prompt = """
+# 役割 (Role)
+あなたは {company_name} のカスタマーサポートエージェントです。
+顧客の注文・返金・アカウントに関する問題を解決します。
+
+# 能力と制約 (Capabilities & Constraints)
+## できること
+- 注文状況の確認
+- $500 以下の返金処理
+- サポートチケットの作成
+
+## できないこと
+- $500 を超える返金 (人間にエスカレーション)
+- アカウントの削除
+- 個人情報の変更 (本人確認が必要)
+
+# 応答スタイル (Response Style)
+- 丁寧で親切なトーンを維持する
+- 簡潔に要点を伝える
+- 専門用語は避け、平易な言葉を使う
+
+# 重要なルール (Critical Rules)
+1. 顧客の情報を確認してから処理を行う
+2. 不確かな場合は確認を取る
+3. エラーは正直に伝える
+"""
+```
+
+### システムプロンプト vs ユーザープロンプト
+
+| 種別 | 適した内容 | 変更頻度 |
+|---|---|---|
+| **システムプロンプト** | 役割、制約、応答スタイル、ビジネスルール | 低 (固定) |
+| **ユーザープロンプト** | タスク固有の指示、入力データ、コンテキスト | 高 (動的) |
+
+## 2. JSON schema 設計: nullable vs optional
 
 ### nullable と optional の使い分け
 
@@ -36,7 +78,7 @@ schema = {
 }
 ```
 
-## 2. `tool_use` + `tool_choice` による structured output
+## 3. `tool_use` + `tool_choice` による structured output
 
 ### tool_choice で JSON 出力を強制する
 
@@ -93,7 +135,7 @@ tool_use_block = next(b for b in response.content if b.type == "tool_use")
 extracted_data = tool_use_block.input
 ```
 
-## 3. Semantic Validation
+## 4. Semantic Validation
 
 ### calculated_total vs stated_total
 
@@ -136,7 +178,7 @@ def validate_invoice(data: dict) -> tuple[bool, list[str]]:
     return len(errors) == 0, errors
 ```
 
-## 4. Validation-Retry ループ
+## 5. Validation-Retry ループ
 
 ```python
 MAX_RETRIES = 3
@@ -178,7 +220,7 @@ def extract_with_retry(invoice_text: str) -> dict:
     raise ValueError(f"Extraction failed after {MAX_RETRIES} attempts: {errors}")
 ```
 
-## 5. Human Review Routing
+## 6. Human Review Routing
 
 ```python
 def route_extraction_result(data: dict, errors: list[str]) -> str:
@@ -207,7 +249,7 @@ def route_extraction_result(data: dict, errors: list[str]) -> str:
     return "human_review"
 ```
 
-## 6. Few-Shot でフォーマット制御
+## 7. Few-Shot でフォーマット制御
 
 ```python
 messages = [
@@ -240,6 +282,157 @@ messages = [
 ]
 ```
 
+## 8. Extended Thinking (拡張思考)
+
+### Extended Thinking とは
+
+モデルが回答前に内部で推論する「思考ステップ」を有効にする機能です。  
+複雑な問題や多段階の推論が必要なタスクで精度が向上します。
+
+```python
+import anthropic
+
+client = anthropic.Anthropic()
+
+response = client.messages.create(
+    model="claude-opus-4-5",
+    max_tokens=16000,
+    thinking={
+        "type": "enabled",
+        "budget_tokens": 10000  # 思考に使えるトークン数の上限
+    },
+    messages=[{
+        "role": "user",
+        "content": """
+        以下の複雑な契約条項を分析して、リスクを評価してください:
+        {contract_text}
+        """
+    }]
+)
+
+# 思考ブロックと回答ブロックを分離して処理
+for block in response.content:
+    if block.type == "thinking":
+        # 思考プロセス (デバッグ・監査用)
+        print(f"Thinking: {block.thinking}")
+    elif block.type == "text":
+        # 最終的な回答
+        print(f"Answer: {block.text}")
+```
+
+### Extended Thinking の活用場面
+
+| 場面 | 効果 |
+|---|---|
+| 複雑なコードのデバッグ | 多段階の原因分析が正確になる |
+| 法的・医療的文書の分析 | 慎重な推論が必要な判断が改善 |
+| 数学的・論理的問題 | ステップバイステップの解法 |
+| 複数条件の意思決定 | 条件の整理と優先付けが明確 |
+
+### Extended Thinking の注意点
+
+```python
+# ★ Extended Thinking 有効時は streaming が必須
+with client.messages.stream(
+    model="claude-opus-4-5",
+    max_tokens=16000,
+    thinking={"type": "enabled", "budget_tokens": 5000},
+    messages=[{"role": "user", "content": "複雑な分析タスク..."}]
+) as stream:
+    for event in stream:
+        if hasattr(event, "type"):
+            if event.type == "content_block_start":
+                if event.content_block.type == "thinking":
+                    print("Thinking started...")
+```
+
+## 9. プロンプトエンジニアリングの高度なテクニック
+
+### XML タグによる構造化
+
+```python
+prompt = """
+以下の情報を使って顧客への回答を作成してください。
+
+<customer_info>
+名前: {customer_name}
+顧客ID: {customer_id}
+VIPステータス: {is_vip}
+</customer_info>
+
+<order_info>
+注文ID: {order_id}
+金額: ${amount}
+ステータス: {status}
+</order_info>
+
+<task>
+顧客から返金申請がありました。
+適切な回答を作成してください。
+</task>
+"""
+```
+
+### Prefill (アシスタントの応答先読み)
+
+モデルの応答の始まりを指定することで、出力フォーマットを制御できます。
+
+```python
+response = client.messages.create(
+    model="claude-opus-4-5",
+    max_tokens=1024,
+    messages=[
+        {
+            "role": "user",
+            "content": "注文 ORD-12345 の状況を JSON で教えてください"
+        },
+        {
+            # ★ assistant の応答先読みで JSON を強制
+            "role": "assistant",
+            "content": "```json\n{"
+        }
+    ]
+)
+# レスポンスは { から始まり、JSON 形式になる
+```
+
+> **注意**: Prefill は claude.ai では使用できません。API 専用の機能です。
+
+### Chain of Thought (CoT) プロンプティング
+
+```python
+cot_prompt = """
+顧客からの返金申請を処理してください。
+
+# 手順
+以下のステップで考えてください:
+
+<thinking>
+1. 注文情報を確認する (注文ID, 金額, 購入日)
+2. 返金ポリシーを確認する (30日以内か？)
+3. 金額が閾値以下か確認する ($500 以下か？)
+4. エスカレーションが必要か判断する
+5. 最終的なアクションを決定する
+</thinking>
+
+考えた後、顧客への回答と処理アクションを提供してください。
+"""
+```
+
+### 役割付与 (Role Assignment)
+
+```python
+# 専門知識を引き出す役割設定
+specialist_system = """
+あなたは15年のキャリアを持つシニアセキュリティエンジニアです。
+SOC 2 Type II, ISO 27001 の認証経験があり、
+クラウドセキュリティアーキテクチャの設計を専門としています。
+
+セキュリティの観点から、潜在的なリスクを見落とさず、
+具体的かつ実行可能な推奨事項を提供することに長けています。
+"""
+```
+
 ## 試験で問われやすいパターン
 
 1. **nullable vs optional の設計** – どちらを使うべきか
@@ -247,3 +440,6 @@ messages = [
 3. **semantic validation の必要性** – スキーマ検証だけでは不十分な理由
 4. **retry 時のエラーコンテキスト** – 単純リトライ vs エラー情報付きリトライ
 5. **human review の判断基準** – どの条件でエスカレーションするか
+6. **Extended Thinking の適用場面** – 複雑な推論が必要なタスクとは
+7. **Prefill の用途** – JSON 出力強制への活用（API専用）
+8. **XML タグの効果** – コンテキスト分離による精度向上

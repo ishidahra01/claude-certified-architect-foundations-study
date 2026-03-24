@@ -563,124 +563,151 @@ def create_handoff_summary(
 
 フックは**決定論的な保証**を提供します。プロンプト指示はモデルが従わない可能性がありますが、フックはコードレベルで強制されるため失敗率はゼロです。異なるソースからの異種データ形式の正規化や、ポリシー違反アクションのブロックに不可欠です。
 
+> **重要**: Claude Code Agent SDK のフックは、Python 関数を自前実装して呼び出すものではありません。  
+> `.claude/settings.json` に設定を書き、Claude Code が**自動的にシェルスクリプト/コマンドを実行**する仕組みです。  
+> 詳細: https://platform.claude.com/docs/en/agent-sdk/hooks
+
+### SDK フックの仕組み
+
+Claude Code Agent SDK のフックは、**設定ファイルに登録した外部コマンド**がエージェントのライフサイクルの各ポイントで自動実行されます。
+
+```
+ツール呼び出し要求
+       ↓
+ [PreToolUse フック]   ← .claude/settings.json で登録したコマンドが stdin でイベントを受け取る
+       ↓                   exit 0 = 許可, exit 2 = ブロック
+ ツール実行
+       ↓
+ [PostToolUse フック]  ← ツール実行後に自動実行（監査ログ、通知など）
+       ↓
+ モデルへ返却
+```
+
+**コミュニケーション方式**:
+- **入力**: イベントデータが **stdin** に JSON 形式で渡される
+- **出力**: **終了コード** でアクションを制御する
+  - `exit 0` → 許可（処理を継続）
+  - `exit 2` → **ブロック**（ツール呼び出しを中止してエラーをモデルに通知）
+  - 他の値 → 警告（処理は継続、stderr のメッセージがユーザーに表示）
+
+### ✅ `.claude/settings.json` によるフック設定
+
+```json
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "process_refund",
+        "hooks": [
+          {
+            "type": "command",
+            "command": ".claude/hooks/pre_tool_use_refund.sh"
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": ".claude/hooks/post_tool_use_audit.sh"
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+- **`matcher`**: ツール名にマッチする正規表現（`""` = 全ツール、`"Write|Edit"` = Write か Edit のみ）
+- **`type`**: `"command"` (シェルコマンド)、`"http"` (HTTPエンドポイント)、`"prompt"` (LLM判断) など
+- 設定ファイルの場所: プロジェクト固有 → `.claude/settings.json` / ユーザー全体 → `~/.claude/settings.json`
+
+### ✅ PreToolUse フック: ポリシー違反ブロック
+
+フックスクリプトは **stdin** でイベントの JSON を受け取り、終了コードでアクションを制御します。
+
+```bash
+#!/usr/bin/env bash
+# .claude/hooks/pre_tool_use_refund.sh
+# 返金額が自動承認上限を超える場合にツール呼び出しをブロックする
+
+set -euo pipefail
+
+# stdin からイベントデータを読み込む
+input=$(cat)
+
+TOOL_NAME=$(echo "$input" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('tool_name',''))")
+AMOUNT=$(echo "$input" | python3 -c "
+import sys, json
+d = json.load(sys.stdin)
+print(d.get('tool_input', {}).get('amount', 0))
+")
+
+REFUND_LIMIT=500
+
+if [ "$TOOL_NAME" = "process_refund" ]; then
+    # awk で浮動小数点比較（bc より可搬性が高い）
+    if awk -v amount="$AMOUNT" -v limit="$REFUND_LIMIT" 'BEGIN { exit (amount > limit) ? 0 : 1 }'; then
+        echo "ポリシー違反: 返金額 \$$AMOUNT が自動承認上限 \$$REFUND_LIMIT を超過しています。" >&2
+        exit 2  # ★ Claude にツール実行をブロックさせる
+    fi
+fi
+
+exit 0  # 許可
+```
+
+### ✅ PostToolUse フック: 監査ログの記録
+
+```bash
+#!/usr/bin/env bash
+# .claude/hooks/post_tool_use_audit.sh
+# 全ツール実行を監査ログに記録する（PostToolUse は exit code によるブロック不可）
+
+set -euo pipefail
+
+input=$(cat)
+
+TOOL_NAME=$(echo "$input" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('tool_name','unknown'))")
+TIMESTAMP=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+LOG_FILE="${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/audit.log"
+
+echo "[$TIMESTAMP] tool_used=$TOOL_NAME" >> "$LOG_FILE"
+
+exit 0
+```
+
+### 利用可能なフックイベント一覧
+
+| イベント | 発火タイミング | ブロック可否 | 主な用途 |
+|---|---|---|---|
+| **PreToolUse** | ツール実行前 | ✅ 可 | セキュリティチェック、ポリシー強制 |
+| **PostToolUse** | ツール実行後 | ❌ 不可 | 監査ログ、フォーマット、通知 |
+| **SessionStart** | セッション開始時 | ❌ 不可 | コンテキスト初期化、ログ開始 |
+| **Stop** | エージェント応答完了時 | ✅ 可 | 最終バリデーション、レポート生成 |
+| **Notification** | 通知送信時 | ❌ 不可 | Slack 通知、メールアラート |
+| **SubagentStart** | サブエージェント起動時 | ❌ 不可 | サブエージェントの追跡 |
+
 ### フック vs プロンプト指示の比較
 
-| | プロンプト指示 | フック |
+| | プロンプト指示 | SDK フック |
 |---|---|---|
 | **コンプライアンス** | 確率的（失敗あり） | 決定論的（必ず実行） |
-| **適用タイミング** | モデルが解釈する時 | ツール呼び出しの前後 |
+| **実装方法** | システムプロンプト | `.claude/settings.json` + スクリプト |
+| **適用タイミング** | モデルが解釈する時 | ツール呼び出しの前後（コードレベル） |
 | **用途** | スタイル・ヒューリスティック | セキュリティ・監査・変換 |
-
-### ✅ PostToolUse フック: 異種データ形式の正規化
-
-```python
-from datetime import datetime, timezone
-
-def post_tool_use_normalizer(tool_name: str, tool_result: dict) -> dict:
-    """
-    複数の MCP ツールから返される異種データ形式を
-    モデルが処理する前に統一形式に正規化する。
-    """
-    normalized = dict(tool_result)
-    
-    # Unix タイムスタンプ → ISO 8601 に変換
-    if "created_at" in normalized and isinstance(normalized["created_at"], (int, float)):
-        ts = normalized["created_at"]
-        normalized["created_at"] = datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
-        normalized["_created_at_original_format"] = "unix_timestamp"
-    
-    # 数値ステータスコード → 意味のある文字列に変換
-    STATUS_MAP = {1: "active", 2: "pending", 3: "suspended", 4: "closed"}
-    if "status" in normalized and isinstance(normalized["status"], int):
-        original = normalized["status"]
-        normalized["status"] = STATUS_MAP.get(original, f"unknown({original})")
-        normalized["_status_original"] = original
-    
-    # 金額: セント単位 → ドル単位に変換（特定ツールのみ）
-    if tool_name in ("legacy_billing_api", "old_payment_gateway"):
-        if "amount_cents" in normalized:
-            normalized["amount_usd"] = normalized.pop("amount_cents") / 100
-    
-    return normalized
-
-
-def execute_tool_with_hooks(tool_name: str, tool_input: dict) -> dict:
-    """フック付きツール実行"""
-    # PreToolUse フック（呼び出し前）
-    tool_input = pre_tool_use_hook(tool_name, tool_input)
-    
-    # 実際のツール実行
-    raw_result = dispatch_tool(tool_name, tool_input)
-    
-    # PostToolUse フック（結果をモデルに返す前）
-    normalized_result = post_tool_use_normalizer(tool_name, raw_result)
-    
-    return normalized_result
-```
-
-### ✅ ツール呼び出しインターセプションフック: ポリシー違反ブロック
-
-```python
-REFUND_AUTO_APPROVE_LIMIT = 500.0  # USD
-
-def pre_tool_use_hook(tool_name: str, tool_input: dict) -> dict:
-    """
-    ツール呼び出しをブロックしてコンプライアンスを強制する。
-    プロンプト指示ではなくコードで保証する（決定論的）。
-    """
-    if tool_name == "process_refund":
-        amount = tool_input.get("amount", 0)
-        
-        if amount > REFUND_AUTO_APPROVE_LIMIT:
-            # ★ ブロックして別ワークフロー（人間エスカレーション）にリダイレクト
-            raise PolicyViolationError(
-                tool_name="process_refund",
-                reason=f"返金額 ${amount} が自動承認上限 ${REFUND_AUTO_APPROVE_LIMIT} を超過",
-                redirect_to="human_escalation_workflow",
-                context={
-                    "amount": amount,
-                    "order_id": tool_input.get("order_id"),
-                    "customer_id": tool_input.get("customer_id"),
-                },
-            )
-    
-    return tool_input  # 変更なしで通過
-
-
-class PolicyViolationError(Exception):
-    def __init__(self, tool_name: str, reason: str, redirect_to: str, context: dict):
-        super().__init__(reason)
-        self.tool_name = tool_name
-        self.reason = reason
-        self.redirect_to = redirect_to
-        self.context = context
-
-
-def execute_tool_with_policy_enforcement(tool_name: str, tool_input: dict) -> dict:
-    try:
-        validated_input = pre_tool_use_hook(tool_name, tool_input)
-        result = dispatch_tool(tool_name, validated_input)
-        return post_tool_use_normalizer(tool_name, result)
-    except PolicyViolationError as e:
-        # ポリシー違反をモデルに通知してリダイレクトを指示
-        return {
-            "isError": True,
-            "error": "POLICY_VIOLATION",
-            "reason": e.reason,
-            "redirect_to": e.redirect_to,
-            "context": e.context,
-            "message": f"このアクションは自動処理できません: {e.reason}",
-        }
-```
 
 ### フックの選択基準まとめ
 
 ```
-フックを使う場合:
+SDK フックを使う場合:
   ✅ 返金額の上限チェック（決定論的保証が必要）
-  ✅ 異種APIレスポンスの形式統一（正規化）
   ✅ 監査ログの記録（全ツール呼び出しを漏れなく記録）
   ✅ レート制限・スロットリング
+  ✅ 危険なコマンドのブロック（rm -rf など）
+  ✅ CI/CD との連携（フォーマット、テスト自動実行）
 
 プロンプト指示で十分な場合:
   ✅ 回答の言語・トーン
@@ -1111,10 +1138,12 @@ async def security_investigation():
 - 複数懸念事項の調査は**並列**で実行して効率化
 
 ### Task 1.5 のポイント
-- **PostToolUse フック**: ツール結果をモデルに渡す前に変換（形式統一、エンリッチメント）
-- **PreToolUse フック**: ツール呼び出しをブロックしてポリシーを強制
+- **SDK フックは `.claude/settings.json` で設定する**（Python 関数を自前実装して呼び出すのではない）
+- **PreToolUse フック**: `exit 2` でツール呼び出しをブロックしてポリシーを強制（stdin でイベント JSON を受け取る）
+- **PostToolUse フック**: ツール実行後に監査ログや通知を実行（ブロック不可）
 - フックはプロンプト指示より**確実**（決定論的）
 - 監査・ログ記録にはフックが最適（漏れなし）
+- 参照: https://platform.claude.com/docs/en/agent-sdk/hooks
 
 ### Task 1.6 のポイント
 - **プロンプトチェイニング**: 予測可能なステップ（コードレビュー等）

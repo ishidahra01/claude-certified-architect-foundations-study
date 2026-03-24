@@ -6,7 +6,9 @@ Lab 01: Customer Support Agent
 - isError パターンによるツールエラー表現
 - Hook / Gate による deterministic な escalation
 - Prompt vs Code での制約の使い分け
-- PostToolUse フックによるデータ正規化
+- Agent SDK Hooks によるデータ正規化・ポリシー強制
+  ★ Claude Code SDK のフックは .claude/settings.json + シェルスクリプトで設定する
+  ★ 参照: https://platform.claude.com/docs/en/agent-sdk/hooks
 - アンチパターンとその問題点の理解
 """
 
@@ -59,7 +61,7 @@ ORDERS_DB = {
         "total": 120000,
         "status": "delivered",
         "can_refund": True,
-        # Unix タイムスタンプ (PostToolUse フックで ISO 8601 に変換される)
+        # Unix タイムスタンプ (後処理で ISO 8601 に変換される)
         "created_at": 1704067200,
         "delivered_at": 1704326400,
         "status_code": 200,
@@ -219,7 +221,13 @@ TOOLS = [
 
 
 # ────────────────────────────────────────────────
-# PostToolUse フック
+# PostToolUse 後処理（データ正規化）
+#
+# ★ 注意: これは Python SDK を直接使った自前実装です。
+# Claude Code Agent SDK を使う場合、フックは Python 関数ではなく
+# .claude/settings.json に登録したシェルスクリプトが自動実行されます。
+# → .claude/settings.json, .claude/hooks/ ディレクトリを参照してください。
+# → 参照: https://platform.claude.com/docs/en/agent-sdk/hooks
 # ────────────────────────────────────────────────
 
 def post_tool_use_hook(
@@ -228,19 +236,23 @@ def post_tool_use_hook(
     learn: bool = False,
 ) -> dict[str, Any]:
     """
-    ツール実行後に呼び出されるフック。
+    ツール実行後のデータ正規化処理。
 
     - Unix タイムスタンプを ISO 8601 形式に変換する
     - 数値ステータスコードに人間可読な説明を追加する
 
     これにより、異なるバックエンドシステムからのデータ形式を統一し、
     モデルが一貫した形式で情報を処理できるようにする。
+
+    Claude Code Agent SDK を使う場合、この処理は .claude/settings.json の
+    PostToolUse フック設定 + シェルスクリプトで実現します。
     """
     if learn:
         print(
-            "\n  📌 [LEARN] PostToolUse フック実行中"
-            f"\n     なぜフック後処理か: 異なるシステムから返ってくるデータ形式を統一することで、"
+            "\n  📌 [LEARN] PostToolUse 後処理（データ正規化）実行中"
+            f"\n     なぜ後処理か: 異なるシステムから返ってくるデータ形式を統一することで、"
             "\n     モデルが一貫した形式で情報を処理できる"
+            "\n     ★ Claude Code SDK では .claude/settings.json の PostToolUse フックで設定する"
         )
 
     normalized = dict(result)
@@ -458,7 +470,7 @@ def execute_tool(
     tool_input: dict[str, Any],
     learn: bool = False,
 ) -> dict[str, Any]:
-    """ツール名に応じてツールを実行し、PostToolUse フックを適用する"""
+    """ツール名に応じてツールを実行し、データ正規化後処理を適用する"""
     tool_map = {
         "get_customer": get_customer,
         "lookup_order": lookup_order,
@@ -483,7 +495,7 @@ def execute_tool(
 
     raw_result = tool_fn(**tool_input)
 
-    # ★ PostToolUse フックの適用
+    # ★ データ正規化後処理（Claude Code SDK では PostToolUse フックが担う処理）
     normalized_result = post_tool_use_hook(tool_name, raw_result, learn=learn)
 
     return normalized_result

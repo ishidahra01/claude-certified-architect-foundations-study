@@ -17,3 +17,7 @@ env/
 # OS
 .DS_Store
 Thumbs.db
+
+# Claude Code hooks runtime artifacts
+labs/*/.claude/hooks/audit.log
+**/audit.log

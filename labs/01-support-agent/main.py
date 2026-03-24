@@ -20,6 +20,9 @@ from typing import Any
 
 import anthropic
 
+from dotenv import load_dotenv
+load_dotenv()
+
 # ────────────────────────────────────────────────
 # 設定値 (業務ルールは code で担保する)
 # ────────────────────────────────────────────────

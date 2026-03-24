@@ -8,7 +8,7 @@
 1. `stop_reason` による agentic loop の制御を理解する (Task 1.1)
 2. 単一責任のツール設計と `isError` パターンを実装する (Task 1.1)
 3. **プログラム的前提条件ゲート** による順序強制を実装する (Task 1.4)
-4. **PostToolUse フック** によるデータ正規化を理解する (Task 1.5)
+4. **Agent SDK Hooks** (`PreToolUse` / `PostToolUse`) の正しい設定方法を理解する (Task 1.5)
 5. **構造化ハンドオフサマリー** を実装する (Task 1.4)
 6. Prompt vs Code での制約の使い分けを体験する (Task 1.5)
 7. **アンチパターン** を実際に確認し、なぜ失敗するかを理解する (Task 1.1)
@@ -25,9 +25,11 @@ Customer Support Agent
   └── escalate_to_human(reason, ctx)   人間へのエスカレーション
         └── 構造化ハンドオフサマリーを出力 (Task 1.4)
 
-PostToolUse フック (全ツール共通):
-  ├── Unix タイムスタンプ → ISO 8601 変換
-  └── 数値ステータスコード → 人間可読な説明に変換 (Task 1.5)
+Agent SDK Hooks (.claude/settings.json で設定):
+  ├── PreToolUse  (.claude/hooks/pre_tool_use_refund.sh)
+  │     └── 返金額が上限を超えたらツール実行をブロック (exit 2)
+  └── PostToolUse (.claude/hooks/post_tool_use_audit.sh)
+        └── 全ツール呼び出しを監査ログに記録
 ```
 
 ## 実行方法
@@ -87,33 +89,49 @@ def process_refund(order_id: str, amount: float, reason: str) -> dict:
 
 **なぜ重要か**: 金融操作の前に身元確認が必要なシステムでは、prompt での指示だけでは非ゼロの失敗率がある。code で前提条件を強制することでゼロ失敗率を達成できる。
 
-### 2. PostToolUse フック によるデータ正規化 (Task 1.5)
+### 2. Agent SDK Hooks によるポリシー強制・監査 (Task 1.5)
 
-```python
-def post_tool_use_hook(tool_name: str, result: dict, learn: bool = False) -> dict:
-    """
-    ★ PostToolUse Hook: ツール結果をモデルが処理する前に正規化する
-    異なるシステムから返ってくる形式の不一致を統一する
-    """
-    def normalize(obj):
-        if isinstance(obj, dict):
-            normalized = {}
-            for k, v in obj.items():
-                if k.endswith("_at") and isinstance(v, int):
-                    # Unix timestamp → ISO 8601
-                    normalized[k] = datetime.datetime.fromtimestamp(v).isoformat()
-                elif k == "status_code" and isinstance(v, int):
-                    # 数値ステータスコード → 人間可読な説明
-                    normalized[k] = v
-                    normalized["status_code_description"] = STATUS_CODE_DESCRIPTIONS.get(v, "Unknown")
-                else:
-                    normalized[k] = normalize(v)
-            return normalized
-        return obj
-    return normalize(result)
+> **重要**: Claude Code Agent SDK のフックは Python 関数を自前実装して呼び出すものでは**ありません**。  
+> `.claude/settings.json` に設定を書き、Claude Code が自動的にシェルスクリプト/コマンドを実行します。  
+> 参照: https://platform.claude.com/docs/en/agent-sdk/hooks
+
+**フックの仕組み**:
+- hooks スクリプトは **stdin** でイベントデータを JSON として受け取る
+- **PreToolUse**: `exit 2` でツール呼び出しをブロックできる（exit 0 = 許可）
+- **PostToolUse**: 監査ログや通知に使う（既に実行済みのためブロック不可）
+
+```json
+// .claude/settings.json
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "process_refund",
+        "hooks": [{ "type": "command", "command": ".claude/hooks/pre_tool_use_refund.sh" }]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "",
+        "hooks": [{ "type": "command", "command": ".claude/hooks/post_tool_use_audit.sh" }]
+      }
+    ]
+  }
+}
 ```
 
-**なぜ重要か**: 複数の MCP ツールやシステムから返ってくるデータ形式は異なる (Unix timestamp vs ISO 8601、数値コード vs 文字列など)。フックで統一することで、モデルは一貫した形式で情報を処理できる。
+```bash
+# .claude/hooks/pre_tool_use_refund.sh
+input=$(cat)  # stdin からイベント JSON を読む
+AMOUNT=$(echo "$input" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('tool_input',{}).get('amount',0))")
+if (( $(echo "$AMOUNT > 500" | bc -l) )); then
+    echo "返金額が上限を超過しています" >&2
+    exit 2  # ★ Claude にブロックさせる
+fi
+exit 0
+```
+
+**main.py について**: このラボの Python コードは `anthropic` SDK を直接使ったカスタム実装です。`post_tool_use_hook()` 関数はデータ正規化の「概念デモ」であり、Claude Code SDK の組み込みフック機能とは異なります。Claude Code を使う場合は上記の `.claude/settings.json` アプローチを使ってください。
 
 ### 3. stop_reason によるループ制御 (Task 1.1)
 
@@ -169,6 +187,6 @@ escalate_to_human(
 | isError パターン | Task 1.1 |
 | プログラム的前提条件ゲート | Task 1.4 |
 | 構造化ハンドオフサマリー | Task 1.4 |
-| PostToolUse フック (データ正規化) | Task 1.5 |
+| Agent SDK Hooks (settings.json + シェルスクリプト) | Task 1.5 |
 | Hook vs Prompt 使い分け | Task 1.5 |
 | アンチパターンの理解 | Task 1.1 |

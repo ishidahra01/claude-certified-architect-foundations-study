@@ -136,6 +136,17 @@ def build_tool_result(payload: dict[str, Any], *, is_error: bool) -> dict[str, A
     - ラボで学習する業務上のエラー表現は JSON 本文の `isError`
     - この 2 つを分離することで、SDK の型に従いつつ試験で問われる
       `isError` パターンもそのまま学べるようにする
+
+    Args:
+        payload: ツールの業務上の返却データ。JSON 文字列にして text block に格納する。
+        is_error: SDK 向けのエラーフラグ。Claude がツール失敗として扱うかを決める。
+
+    Returns:
+        MCP ツール戻り値 dict:
+        {
+            "content": [{"type": "text", "text": "<JSON文字列>"}],
+            "is_error": bool,
+        }
     """
     return {
         "content": [
@@ -206,6 +217,13 @@ def handle_get_customer(customer_id: str) -> dict[str, Any]:
 
 
 def handle_lookup_order(order_id: str) -> dict[str, Any]:
+    """
+    注文情報を生データのまま返す。
+
+    created_at / delivered_at / status_code の正規化はツール本体では行わず、
+    PostToolUse フックで一括実施する。これにより「取得」と「正規化」の
+    関心を分離し、バックエンド差異の吸収をフック側に集約できる。
+    """
     order = ORDERS_DB.get(order_id)
     if not order:
         return {
@@ -224,6 +242,12 @@ def handle_process_refund(order_id: str, amount: float, reason: str) -> dict[str
     Gate 2: 閾値チェック (通常は PreToolUse で先に止める。ここは防御的バックアップ)
     """
     if not session_state["customer_verified"]:
+        if LEARN_MODE:
+            print(
+                "\n  📌 [LEARN] プログラム的前提条件ゲート発動"
+                "\n     prompt で順序を指示するだけでは不十分なので、"
+                "\n     process_refund 側でも customer_verified を確認している"
+            )
         return {
             "isError": True,
             "retryable": True,
@@ -253,6 +277,12 @@ def handle_process_refund(order_id: str, amount: float, reason: str) -> dict[str
         }
 
     if amount > REFUND_THRESHOLD:
+        if LEARN_MODE:
+            print(
+                "\n  📌 [LEARN] バックアップ閾値チェック発動"
+                "\n     通常は PreToolUse フックが先に止めるが、"
+                "\n     ツール本体にも防御的チェックを残して二重で守る"
+            )
         return {
             "isError": True,
             "retryable": False,
@@ -434,6 +464,9 @@ async def pre_tool_use_refund_check(
             },
         }
 
+    if LEARN_MODE:
+        print("     → 閾値以内のため process_refund を許可")
+
     return {}
 
 
@@ -450,6 +483,9 @@ async def post_tool_use_audit_and_normalize(
     - 返ってきた MCP ツール結果を正規化して `updatedMCPToolOutput` で差し替える
 
     公式 SDK の型上、PostToolUse の書き換えは `updatedMCPToolOutput` を使う。
+    このラボでは学習効果を優先し、正規化が意味を持つ lookup_order / process_refund
+    のみに matcher を絞っている。全ツール一律ではなく「どの出力を正規化すべきか」
+    を設計判断として意識するため。
     """
     tool_name = input_data.get("tool_name", "")
     tool_response = input_data.get("tool_response")
@@ -509,8 +545,8 @@ async def post_tool_use_audit_and_normalize(
 # ────────────────────────────────────────────────
 # メッセージ表示
 # ────────────────────────────────────────────────
-def display_message(message: Any) -> str | None:
-    """SDK のストリーム出力を見やすく表示する。"""
+def process_message(message: Any) -> str | None:
+    """SDK メッセージを表示しつつ、最終応答候補のテキストを返す。"""
     final_text: str | None = None
 
     if isinstance(message, AssistantMessage):
@@ -614,7 +650,7 @@ customer_id, order_id, root_cause, refund_amount, recommended_action, conversati
     async with ClaudeSDKClient(options=options) as client:
         await client.query(user_message)
         async for message in client.receive_response():
-            maybe_text = display_message(message)
+            maybe_text = process_message(message)
             if maybe_text:
                 final_response = maybe_text
 
@@ -662,7 +698,7 @@ def run_support_agent_with_antipatterns() -> None:
     )
 
     print(f"\n{sep}")
-    print("【アンチパターン 2】max_iterations=2 を主たる停止機構にする")
+    print("【アンチパターン 2】max_turns=2 を主たる停止機構にする")
     print(sep)
     print("\n❌ WRONG: 低すぎる反復上限に頼ると複数ツール呼び出しで途中終了する\n")
 
@@ -674,10 +710,10 @@ def run_support_agent_with_antipatterns() -> None:
     ]
     for i, (tool_name, desc) in enumerate(typical_tool_sequence, 1):
         too_early = "⛔ 反復上限で強制終了!" if i > 2 else "✅"
-        print(f"    Iter {i}: {tool_name} ({desc}) {too_early}")
+        print(f"    Turn {i}: {tool_name} ({desc}) {too_early}")
 
     print(
-        "\n  💡 問題: max_iterations は安全ネットであり、主要停止機構ではない。"
+        "\n  💡 問題: Agent SDK では max_turns は安全ネットであり、主要停止機構ではない。"
         "\n     実際の終了判定は stop_reason / SDK の完了判定に委ねるべき。"
     )
 
@@ -753,7 +789,7 @@ SCENARIOS = {
 }
 
 
-async def async_main() -> None:
+async def main() -> None:
     parser = argparse.ArgumentParser(
         description="Customer Support Agent Lab (Claude Agent SDK)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -809,4 +845,4 @@ async def async_main() -> None:
 
 
 if __name__ == "__main__":
-    anyio.run(async_main)
+    anyio.run(main)

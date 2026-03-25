@@ -1,51 +1,48 @@
 """
-Lab 04: Multi-Agent Research Pipeline
+Lab 04: Multi-Agent Research Pipeline (Claude Agent SDK 版)
 
 学習目標:
 - Coordinator / Subagent パターン (Hub-and-Spoke)
-- 動的クエリ分析: Claude がどの subagent を呼ぶかを決定 (Task 1.2)
+- Claude Agent SDK の query() で subagent を実行する
+- 動的クエリ分析: 必要な subagent を選択する
 - 並列委譲 (asyncio.gather) + partial failure の処理
-- Subagent への明示的な文脈渡し (暗黙の継承に頼らない)
-- Provenance 付き情報収集・合成 (構造化メタデータ分離)
-- 反復改善ループ: synthesis のギャップ評価と再委譲 (Task 1.2)
-- Timeout と structured error のハンドリング
+- 明示的な文脈渡しと provenance の保持
+- synthesis のギャップ評価と targeted re-delegation
 """
 
+from __future__ import annotations
+
+import argparse
 import asyncio
 import json
-import os
-import argparse
 import time
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, field
 from typing import Any
 
-import anthropic
-
+import anyio
+from claude_agent_sdk import AgentDefinition, ClaudeAgentOptions, query
+from claude_agent_sdk.types import AssistantMessage, ResultMessage, TextBlock
 from dotenv import load_dotenv
-load_dotenv()
 
-# ────────────────────────────────────────────────
-# データモデル
-# ────────────────────────────────────────────────
+load_dotenv()
 
 
 @dataclass
 class SourcedResult:
     """Provenance (情報源) 付きの調査結果"""
+
     content: str
-    source: str           # 情報源の識別子 (URL, doc ID, agent name)
-    confidence: float     # 信頼度 0.0-1.0
-    agent: str            # 担当 subagent の名前
-    retrieved_at: float   # 取得時刻 (Unix timestamp)
+    source: str
+    confidence: float
+    agent: str
+    retrieved_at: float
     key_points: list[str] = field(default_factory=list)
 
 
 @dataclass
 class SourceMetadata:
-    """
-    コンテンツとメタデータを分離した構造化形式。
-    ★ 構造化データフォーマット分離: content と provenance を明示的に分ける。
-    """
+    """コンテンツとメタデータを分離した構造化形式。"""
+
     source_url: str
     agent_name: str
     confidence: float
@@ -55,28 +52,29 @@ class SourceMetadata:
 @dataclass
 class AgentError:
     """Subagent のエラーを structured に表現する"""
+
     agent: str
-    error_type: str       # "timeout" | "api_error" | "validation_error"
+    error_type: str  # "timeout" | "agent_execution_error"
     message: str
     is_retryable: bool
-    failed_at: float      # エラー発生時刻
+    failed_at: float
 
 
 @dataclass
 class ResearchResult:
     """調査全体の結果"""
+
     query: str
     synthesis: str
     sources_used: list[SourcedResult]
     sources_failed: list[AgentError]
     overall_confidence: float
-    is_partial: bool      # 一部の subagent が失敗した場合 True
-    refinement_iterations: int = 0  # 反復改善の回数
+    is_partial: bool
+    refinement_iterations: int = 0
 
 
 @dataclass
 class QueryRequirements:
-    """analyze_query_requirements() の戻り値"""
     needs_web_search: bool
     needs_doc_analysis: bool
     needs_knowledge_base: bool
@@ -85,19 +83,14 @@ class QueryRequirements:
 
 @dataclass
 class SynthesisCoverageEval:
-    """evaluate_synthesis_coverage() の戻り値"""
     is_sufficient: bool
     gaps: list[str]
     targeted_queries: list[str]
 
 
-# ────────────────────────────────────────────────
-# 擬似データ (実際の web search / doc analysis の代わり)
-# ────────────────────────────────────────────────
-
 MOCK_WEB_RESULTS = {
     "default": {
-        "summary": "Web 検索により関連する情報を取得しました。",
+        "summary": "Web 検索により関連する最新情報を取得しました。",
         "url": "https://example.com/article",
         "relevance": 0.85,
     }
@@ -119,83 +112,179 @@ MOCK_KB = {
     }
 }
 
-# ────────────────────────────────────────────────
-# 学習用ユーティリティ
-# ────────────────────────────────────────────────
+QUERY_REQUIREMENTS_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "needs_web_search": {"type": "boolean"},
+        "needs_doc_analysis": {"type": "boolean"},
+        "needs_knowledge_base": {"type": "boolean"},
+        "reasoning": {"type": "string"},
+    },
+    "required": [
+        "needs_web_search",
+        "needs_doc_analysis",
+        "needs_knowledge_base",
+        "reasoning",
+    ],
+}
+
+SUBAGENT_RESULT_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "content": {"type": "string"},
+        "key_points": {"type": "array", "items": {"type": "string"}},
+        "confidence": {"type": "number"},
+    },
+    "required": ["content", "key_points", "confidence"],
+}
+
+SYNTHESIS_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "synthesis": {"type": "string"},
+    },
+    "required": ["synthesis"],
+}
+
+COVERAGE_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "is_sufficient": {"type": "boolean"},
+        "gaps": {"type": "array", "items": {"type": "string"}},
+        "targeted_queries": {"type": "array", "items": {"type": "string"}},
+    },
+    "required": ["is_sufficient", "gaps", "targeted_queries"],
+}
 
 
 def learn(msg: str, enabled: bool) -> None:
-    """--learn フラグが有効な場合のみ教育ノートを表示する"""
     if enabled:
         print(f"\n🎓 [LEARN] {msg}\n")
 
 
-# ────────────────────────────────────────────────
-# Dynamic Query Analysis (Task 1.2: 動的選択)
-# ────────────────────────────────────────────────
+def build_requirements_prompt(query_text: str) -> str:
+    return (
+        "あなたは調査パイプラインのコーディネーターです。"
+        "以下のクエリに対して、どの情報源が必要かを判断してください。\n\n"
+        f"クエリ: {query_text}\n\n"
+        "利用可能な情報源:\n"
+        "- web_search: 最新情報・ニュース・外部記事の検索\n"
+        "- doc_analysis: 社内ドキュメント・仕様書の分析\n"
+        "- knowledge_base: FAQ・ナレッジベースの検索\n"
+        "冗長な説明は不要です。"
+    )
 
 
-def analyze_query_requirements(
-    query: str,
-    client: anthropic.Anthropic,
+def build_subagent_prompt(query_text: str, evidence_label: str, evidence_body: str) -> str:
+    return (
+        f"調査クエリ: {query_text}\n\n"
+        f"利用可能な入力 ({evidence_label}):\n{evidence_body}\n\n"
+        "与えられた情報だけを使って調査結果をまとめてください。"
+        "推測や新しい外部情報の追加は禁止です。"
+    )
+
+
+def build_synthesis_prompt(query_text: str, sources: list[SourcedResult]) -> str:
+    attributions = [
+        {
+            "source_url": s.source,
+            "agent_name": s.agent,
+            "confidence": s.confidence,
+            "retrieved_at": s.retrieved_at,
+        }
+        for s in sources
+    ]
+    contents = [f"[情報源 {i + 1}] {s.content}" for i, s in enumerate(sources)]
+    return (
+        f"調査クエリ: {query_text}\n\n"
+        f"情報源メタデータ (JSON):\n{json.dumps(attributions, ensure_ascii=False, indent=2)}\n\n"
+        "情報源コンテンツ:\n"
+        + "\n\n".join(contents)
+        + "\n\n出典と不確実性を反映しながら統合回答を作成してください。"
+    )
+
+
+def build_coverage_prompt(query_text: str, synthesis: str) -> str:
+    return (
+        f"調査クエリ: {query_text}\n\n"
+        f"現在の synthesis:\n{synthesis}\n\n"
+        "カバレッジの不足があるか評価し、必要なら targeted query を提案してください。"
+    )
+
+
+async def run_query_with_schema(
+    *,
+    prompt: str,
+    schema: dict[str, Any],
+    verbose: bool = False,
+    label: str | None = None,
+    agent_name: str | None = None,
+    agent_description: str | None = None,
+    agent_prompt: str | None = None,
+    agent_model: str = "haiku",
+) -> dict[str, Any]:
+    agents = None
+    final_prompt = prompt
+    context = label or agent_name or "unknown operation"
+    should_log_text = verbose and label is not None
+    if agent_name and agent_description and agent_prompt:
+        agents = {
+            agent_name: AgentDefinition(
+                description=agent_description,
+                prompt=agent_prompt,
+                model=agent_model,
+            )
+        }
+        final_prompt = f"Use the {agent_name} agent.\n\n{prompt}"
+
+    options = ClaudeAgentOptions(
+        agents=agents,
+        output_format={"type": "json_schema", "schema": schema},
+        max_turns=4,
+    )
+
+    result_message: ResultMessage | None = None
+    async for message in query(prompt=final_prompt, options=options):
+        if isinstance(message, AssistantMessage) and should_log_text:
+            for block in message.content:
+                if isinstance(block, TextBlock):
+                    print(f"  [{label}] {block.text}")
+        elif isinstance(message, ResultMessage):
+            result_message = message
+
+    if result_message is None:
+        raise RuntimeError(f"No result returned from Claude Agent SDK query ({context})")
+    if result_message.is_error:
+        raise RuntimeError(result_message.result or f"Claude Agent SDK query failed ({context})")
+    if result_message.structured_output is None:
+        raise RuntimeError("Structured output was not returned")
+    return result_message.structured_output
+
+
+async def analyze_query_requirements(
+    query_text: str,
     verbose: bool = True,
     learn_mode: bool = False,
 ) -> QueryRequirements:
-    """
-    ★ Hub-and-Spoke: Coordinator がクエリを分析してどの subagent を起動するか決める。
-    サブエージェント同士は互いに通信しない — 全ての判断はここを通る。
-
-    Claude にクエリを見せて、必要な subagent を JSON で返してもらう。
-    """
-    # ★ なぜ動的選択か (--learn で表示)
     learn(
-        "なぜ動的選択か: 毎回全パイプラインを通すと、単純な質問に対してもリソースを無駄遣いする。"
-        "クエリ要件に基づいて必要なエージェントだけ起動する",
+        "なぜ動的選択か: 毎回全パイプラインを通すと、単純な質問にも不要な subagent を起動してしまう。",
         learn_mode,
     )
-
     if verbose:
-        print(f"  [Coordinator] Analyzing query requirements with Claude...")
+        print("  [Coordinator] Analyzing query requirements with query()...")
 
-    response = client.messages.create(
-        model="claude-haiku-4-5",
-        max_tokens=256,
-        messages=[
-            {
-                "role": "user",
-                "content": (
-                    "あなたは調査パイプラインのコーディネーターです。\n"
-                    "以下のクエリに対して、どの情報源が必要かを判断してください。\n\n"
-                    f"クエリ: {query}\n\n"
-                    "利用可能な情報源:\n"
-                    "- web_search: 最新情報・ニュース・外部記事の検索\n"
-                    "- doc_analysis: 社内ドキュメント・仕様書の分析\n"
-                    "- knowledge_base: 既存の FAQ・ナレッジベースの検索\n\n"
-                    "以下の JSON 形式だけで回答してください (説明不要):\n"
-                    '{"needs_web_search": true/false, '
-                    '"needs_doc_analysis": true/false, '
-                    '"needs_knowledge_base": true/false, '
-                    '"reasoning": "理由を1文で"}'
-                ),
-            }
-        ],
+    parsed = await run_query_with_schema(
+        prompt=build_requirements_prompt(query_text),
+        schema=QUERY_REQUIREMENTS_SCHEMA,
+        verbose=False,
+        label="Coordinator",
     )
-
-    raw = response.content[0].text.strip()
-    # JSON ブロックが ```json ... ``` で囲まれていた場合も対応
-    if raw.startswith("```"):
-        raw = raw.split("```")[1]
-        if raw.startswith("json"):
-            raw = raw[4:]
-    parsed = json.loads(raw)
-
     reqs = QueryRequirements(
         needs_web_search=bool(parsed.get("needs_web_search", True)),
         needs_doc_analysis=bool(parsed.get("needs_doc_analysis", True)),
         needs_knowledge_base=bool(parsed.get("needs_knowledge_base", True)),
         reasoning=parsed.get("reasoning", ""),
     )
-
     if verbose:
         selected = [
             name
@@ -208,405 +297,194 @@ def analyze_query_requirements(
         ]
         print(f"  [Coordinator] Selected agents: {selected}")
         print(f"  [Coordinator] Reasoning: {reqs.reasoning}")
-
     return reqs
 
 
-# ────────────────────────────────────────────────
-# Iterative Refinement Evaluation (Task 1.2: 反復改善)
-# ────────────────────────────────────────────────
-
-
-def evaluate_synthesis_coverage(
-    query: str,
+async def evaluate_synthesis_coverage(
+    query_text: str,
     synthesis: str,
-    client: anthropic.Anthropic,
     verbose: bool = True,
     learn_mode: bool = False,
 ) -> SynthesisCoverageEval:
-    """
-    ★ Hub-and-Spoke: Coordinator が synthesis の品質を評価し、
-    ギャップがあれば subagent への追加委譲クエリを生成する。
-    サブエージェントはこの評価結果を直接受け取らない — Coordinator 経由。
-    """
-    # ★ なぜ反復改善か (--learn で表示)
     learn(
-        "なぜ反復改善か: 1回の synthesis では情報が不足することがある。"
-        "コーディネーターがギャップを評価して再委譲する",
+        "なぜ反復改善か: synthesis が一度で十分とは限らないため、Coordinator が不足を評価して再委譲する。",
         learn_mode,
     )
-
     if verbose:
-        print(f"  [Coordinator] Evaluating synthesis coverage...")
+        print("  [Coordinator] Evaluating synthesis coverage...")
 
-    response = client.messages.create(
-        model="claude-haiku-4-5",
-        max_tokens=512,
-        messages=[
-            {
-                "role": "user",
-                "content": (
-                    "以下の調査クエリと合成結果を評価してください。\n\n"
-                    f"調査クエリ: {query}\n\n"
-                    f"合成結果:\n{synthesis}\n\n"
-                    "合成結果にカバレッジのギャップがあるかどうかを判断し、"
-                    "以下の JSON 形式だけで回答してください (説明不要):\n"
-                    '{"is_sufficient": true/false, '
-                    '"gaps": ["不足している情報1", "不足している情報2"], '
-                    '"targeted_queries": ["ギャップ1のための具体的クエリ", "ギャップ2のための具体的クエリ"]}'
-                ),
-            }
-        ],
+    parsed = await run_query_with_schema(
+        prompt=build_coverage_prompt(query_text, synthesis),
+        schema=COVERAGE_SCHEMA,
+        verbose=False,
+        label="Coverage",
     )
-
-    raw = response.content[0].text.strip()
-    if raw.startswith("```"):
-        raw = raw.split("```")[1]
-        if raw.startswith("json"):
-            raw = raw[4:]
-    parsed = json.loads(raw)
-
-    eval_result = SynthesisCoverageEval(
+    return SynthesisCoverageEval(
         is_sufficient=bool(parsed.get("is_sufficient", True)),
-        gaps=parsed.get("gaps", []),
-        targeted_queries=parsed.get("targeted_queries", []),
+        gaps=list(parsed.get("gaps", [])),
+        targeted_queries=list(parsed.get("targeted_queries", [])),
     )
 
+
+async def run_subagent(
+    *,
+    agent_name: str,
+    agent_description: str,
+    agent_prompt: str,
+    query_text: str,
+    evidence_label: str,
+    evidence_body: str,
+    source_url: str,
+    default_confidence: float,
+    simulate_timeout: bool,
+    timeout_message: str,
+    verbose: bool,
+    learn_mode: bool,
+) -> SourcedResult:
+    learn(
+        "なぜ明示的な文脈渡しか: subagent は Coordinator の会話履歴を自動継承しないため、必要情報を明示的に渡す。",
+        learn_mode,
+    )
     if verbose:
-        if eval_result.is_sufficient:
-            print(f"  [Coordinator] Synthesis is sufficient.")
-        else:
-            print(f"  [Coordinator] Gaps found: {eval_result.gaps}")
-            print(f"  [Coordinator] Targeted queries: {eval_result.targeted_queries}")
+        print(f"  [{agent_name}] Running subagent via query()...")
+    if simulate_timeout:
+        await asyncio.sleep(0.1)
+        raise TimeoutError(timeout_message)
 
-    return eval_result
-
-
-# ────────────────────────────────────────────────
-# Subagent 実装
-# ────────────────────────────────────────────────
-# ★ Hub-and-Spoke パターン: サブエージェントは互いに通信しない。
-#   全ての入出力は Coordinator (research_coordinator) を経由する。
-#   これにより、エラーハンドリングと情報フローを一元管理できる。
+    parsed = await run_query_with_schema(
+        prompt=build_subagent_prompt(query_text, evidence_label, evidence_body),
+        schema=SUBAGENT_RESULT_SCHEMA,
+        verbose=False,
+        label=agent_name,
+        agent_name=agent_name,
+        agent_description=agent_description,
+        agent_prompt=agent_prompt,
+    )
+    retrieved_at = time.time()
+    metadata = SourceMetadata(
+        source_url=source_url,
+        agent_name=agent_name,
+        confidence=float(parsed.get("confidence", default_confidence)),
+        retrieved_at=retrieved_at,
+    )
+    return SourcedResult(
+        content=parsed.get("content", ""),
+        source=metadata.source_url,
+        confidence=metadata.confidence,
+        agent=metadata.agent_name,
+        retrieved_at=metadata.retrieved_at,
+        key_points=list(parsed.get("key_points", [])),
+    )
 
 
 async def web_search_agent(
-    query: str,
-    client: anthropic.Anthropic,
+    query_text: str,
     simulate_timeout: bool = False,
     verbose: bool = True,
     learn_mode: bool = False,
 ) -> SourcedResult:
-    """
-    Web 検索 Subagent
-
-    ★ Hub-and-Spoke: この関数は Coordinator からのみ呼ばれる。
-    ★ 独立コンテキスト: 親の会話履歴は引き継がない。query を明示的に受け取る。
-    """
-    # ★ なぜ独立コンテキストか (--learn で表示)
-    learn(
-        "なぜ独立コンテキストか: サブエージェントはコーディネーターの会話履歴を自動継承しない。"
-        "必要な情報は明示的に渡す",
-        learn_mode,
-    )
-
-    if verbose:
-        print(f"  [WebSearch] Searching: {query}")
-
-    if simulate_timeout:
-        await asyncio.sleep(0.1)
-        raise TimeoutError("Web search timed out after 5s")
-
-    # 擬似 web search (実際は web API を呼び出す)
-    mock_result = MOCK_WEB_RESULTS.get("default")
-
-    # ★ 構造化メタデータ分離: コンテンツと provenance を明示的に分ける
-    metadata = SourceMetadata(
+    mock_result = MOCK_WEB_RESULTS["default"]
+    return await run_subagent(
+        agent_name="web-researcher",
+        agent_description="Summarizes web findings with provenance and caveats.",
+        agent_prompt="You are a web research specialist. Use only the provided evidence. Include caveats when confidence is low.",
+        query_text=query_text,
+        evidence_label="web result",
+        evidence_body=f"URL: {mock_result['url']}\nSummary: {mock_result['summary']}",
         source_url=mock_result["url"],
-        agent_name="web_search_agent",
-        confidence=mock_result["relevance"],
-        retrieved_at=time.time(),
+        default_confidence=mock_result["relevance"],
+        simulate_timeout=simulate_timeout,
+        timeout_message="Web search timed out after 5s",
+        verbose=verbose,
+        learn_mode=learn_mode,
     )
-
-    # ★ Subagent には必要な情報だけを渡す (クリーンなコンテキスト)
-    response = client.messages.create(
-        model="claude-haiku-4-5",
-        max_tokens=512,
-        messages=[
-            {
-                "role": "user",
-                "content": (
-                    f"以下の調査クエリに対して、web 検索で得られた情報を要約してください。\n\n"
-                    f"調査クエリ: {query}\n\n"
-                    f"検索結果の概要: {mock_result['summary']}\n\n"
-                    f"要約を 3 点以内の箇条書きで返してください。"
-                ),
-            }
-        ],
-    )
-
-    summary = response.content[0].text
-    key_points = [line.strip() for line in summary.split("\n") if line.strip().startswith("-")]
-
-    result = SourcedResult(
-        content=summary,
-        source=metadata.source_url,
-        confidence=metadata.confidence,
-        agent=metadata.agent_name,
-        retrieved_at=metadata.retrieved_at,
-        key_points=key_points,
-    )
-
-    if verbose:
-        print(f"  [WebSearch] Done. Confidence: {result.confidence:.0%}")
-
-    return result
 
 
 async def doc_analysis_agent(
-    query: str,
-    client: anthropic.Anthropic,
+    query_text: str,
     simulate_timeout: bool = False,
     verbose: bool = True,
     learn_mode: bool = False,
 ) -> SourcedResult:
-    """
-    ドキュメント分析 Subagent
-
-    ★ Hub-and-Spoke: この関数は Coordinator からのみ呼ばれる。
-    ★ 独立コンテキスト: 親の会話履歴は引き継がない。query を明示的に受け取る。
-    """
-    learn(
-        "なぜ独立コンテキストか: サブエージェントはコーディネーターの会話履歴を自動継承しない。"
-        "必要な情報は明示的に渡す",
-        learn_mode,
-    )
-
-    if verbose:
-        print(f"  [DocAnalysis] Analyzing docs for: {query}")
-
-    if simulate_timeout:
-        await asyncio.sleep(0.1)
-        raise TimeoutError("Document analysis timed out after 10s")
-
-    mock_doc = MOCK_DOCS.get("default")
-
-    # ★ 構造化メタデータ分離
-    metadata = SourceMetadata(
+    mock_doc = MOCK_DOCS["default"]
+    return await run_subagent(
+        agent_name="doc-analyst",
+        agent_description="Analyzes internal documents and extracts only relevant findings.",
+        agent_prompt="You are a document analysis specialist. Use only the supplied document text and cite the document id implicitly in the summary.",
+        query_text=query_text,
+        evidence_label="document",
+        evidence_body=f"Document ID: {mock_doc['doc_id']}\nContent: {mock_doc['content']}",
         source_url=f"doc://{mock_doc['doc_id']}",
-        agent_name="doc_analysis_agent",
-        confidence=mock_doc["relevance"],
-        retrieved_at=time.time(),
+        default_confidence=mock_doc["relevance"],
+        simulate_timeout=simulate_timeout,
+        timeout_message="Document analysis timed out after 10s",
+        verbose=verbose,
+        learn_mode=learn_mode,
     )
-
-    # Claude でドキュメントを分析
-    response = client.messages.create(
-        model="claude-haiku-4-5",
-        max_tokens=512,
-        messages=[
-            {
-                "role": "user",
-                "content": (
-                    f"以下のドキュメントから、調査クエリに関連する重要な情報を抽出してください。\n\n"
-                    f"調査クエリ: {query}\n\n"
-                    f"ドキュメント (ID: {mock_doc['doc_id']}):\n{mock_doc['content']}\n\n"
-                    f"重要ポイントを 3 点以内で返してください。"
-                ),
-            }
-        ],
-    )
-
-    analysis = response.content[0].text
-    key_points = [line.strip() for line in analysis.split("\n") if line.strip().startswith("-")]
-
-    result = SourcedResult(
-        content=analysis,
-        source=metadata.source_url,
-        confidence=metadata.confidence,
-        agent=metadata.agent_name,
-        retrieved_at=metadata.retrieved_at,
-        key_points=key_points,
-    )
-
-    if verbose:
-        print(f"  [DocAnalysis] Done. Confidence: {result.confidence:.0%}")
-
-    return result
 
 
 async def knowledge_base_agent(
-    query: str,
-    client: anthropic.Anthropic,
+    query_text: str,
     simulate_timeout: bool = False,
     verbose: bool = True,
     learn_mode: bool = False,
 ) -> SourcedResult:
-    """
-    ナレッジベース検索 Subagent
-
-    ★ Hub-and-Spoke: この関数は Coordinator からのみ呼ばれる。
-    ★ 独立コンテキスト: 親の会話履歴は引き継がない。query を明示的に受け取る。
-    """
-    learn(
-        "なぜ独立コンテキストか: サブエージェントはコーディネーターの会話履歴を自動継承しない。"
-        "必要な情報は明示的に渡す",
-        learn_mode,
-    )
-
-    if verbose:
-        print(f"  [KnowledgeBase] Querying KB for: {query}")
-
-    if simulate_timeout:
-        await asyncio.sleep(0.1)
-        raise TimeoutError("Knowledge base query timed out after 3s")
-
-    mock_kb = MOCK_KB.get("default")
-
-    # ★ 構造化メタデータ分離
-    metadata = SourceMetadata(
+    mock_kb = MOCK_KB["default"]
+    return await run_subagent(
+        agent_name="knowledge-base-specialist",
+        agent_description="Finds reusable internal knowledge for the given query.",
+        agent_prompt="You are a knowledge base specialist. Use only the provided KB entry and summarize the reusable guidance.",
+        query_text=query_text,
+        evidence_label="knowledge base entry",
+        evidence_body=f"KB ID: {mock_kb['kb_id']}\nContent: {mock_kb['content']}",
         source_url=f"kb://{mock_kb['kb_id']}",
-        agent_name="knowledge_base_agent",
-        confidence=mock_kb["relevance"],
-        retrieved_at=time.time(),
+        default_confidence=mock_kb["relevance"],
+        simulate_timeout=simulate_timeout,
+        timeout_message="Knowledge base query timed out after 3s",
+        verbose=verbose,
+        learn_mode=learn_mode,
     )
 
-    response = client.messages.create(
-        model="claude-haiku-4-5",
-        max_tokens=512,
-        messages=[
-            {
-                "role": "user",
-                "content": (
-                    f"以下の既知情報から、調査クエリに関連する部分を抽出してください。\n\n"
-                    f"調査クエリ: {query}\n\n"
-                    f"ナレッジベース (ID: {mock_kb['kb_id']}):\n{mock_kb['content']}\n\n"
-                    f"関連する情報を簡潔にまとめてください。"
-                ),
-            }
-        ],
-    )
 
-    kb_result = response.content[0].text
-
-    result = SourcedResult(
-        content=kb_result,
-        source=metadata.source_url,
-        confidence=metadata.confidence,
-        agent=metadata.agent_name,
-        retrieved_at=metadata.retrieved_at,
-        key_points=[],
-    )
-
-    if verbose:
-        print(f"  [KnowledgeBase] Done. Confidence: {result.confidence:.0%}")
-
-    return result
-
-
-# ────────────────────────────────────────────────
-# Synthesis
-# ────────────────────────────────────────────────
-
-
-def synthesize_results(
-    query: str,
+async def synthesize_results(
+    query_text: str,
     sources: list[SourcedResult],
-    client: anthropic.Anthropic,
     verbose: bool = True,
 ) -> str:
-    """
-    複数の Subagent 結果を統合する
-
-    ★ 構造化データフォーマット分離: メタデータ (出典・信頼度) と
-      コンテンツを別フィールドで Claude に渡す。Provenance を保持したまま合成する。
-
-    ★ Hub-and-Spoke: この関数は Coordinator からのみ呼ばれる。
-      サブエージェントは互いの結果を直接参照しない。
-    """
     if verbose:
-        print(f"\n  [Synthesis] Combining {len(sources)} sources...")
-
-    # ★ なぜハブ・アンド・スポークか (--learn で表示) は Coordinator で出力。
-    #   ここでは構造化分離を実演: content と metadata を別々に整形して渡す。
-
-    # メタデータリスト (attribution)
-    attributions = [
-        {
-            "source_url": s.source,
-            "agent_name": s.agent,
-            "confidence": s.confidence,
-        }
-        for s in sources
-    ]
-
-    # コンテンツリスト (本文)
-    contents = [
-        f"[情報源 {i+1}] {s.content}"
-        for i, s in enumerate(sources)
-    ]
-
-    response = client.messages.create(
-        model="claude-opus-4-5",
-        max_tokens=1024,
-        messages=[
-            {
-                "role": "user",
-                "content": (
-                    f"以下の複数の情報源から得られた情報を統合して、調査クエリへの回答を作成してください。\n\n"
-                    f"調査クエリ: {query}\n\n"
-                    # ★ attribution (メタデータ) を content と分離して渡す
-                    f"情報源メタデータ (JSON):\n{json.dumps(attributions, ensure_ascii=False, indent=2)}\n\n"
-                    f"情報源コンテンツ:\n" + "\n\n".join(contents) + "\n\n"
-                    f"回答には情報の信頼度や出典を適切に反映してください。"
-                    f"不確実な情報は明示的に「不確実」として示してください。"
-                ),
-            }
-        ],
+        print(f"\n  [Synthesis] Combining {len(sources)} sources with query()...")
+    parsed = await run_query_with_schema(
+        prompt=build_synthesis_prompt(query_text, sources),
+        schema=SYNTHESIS_SCHEMA,
+        verbose=False,
+        label="Synthesis",
+        agent_name="synthesis-agent",
+        agent_description="Combines sourced findings into one answer while preserving uncertainty.",
+        agent_prompt="You are a synthesis specialist. Merge the provided sourced findings, keep provenance in mind, and avoid unsupported claims.",
+        agent_model="sonnet",
     )
-
-    return response.content[0].text
-
-
-# ────────────────────────────────────────────────
-# Parallel Dispatch Helper
-# ────────────────────────────────────────────────
+    return parsed.get("synthesis", "")
 
 
 async def _dispatch_agents(
-    query: str,
-    client: anthropic.Anthropic,
+    query_text: str,
     requirements: QueryRequirements,
     simulate_timeout_agents: list[str],
     simulate_all_fail: bool,
     verbose: bool,
     learn_mode: bool,
 ) -> tuple[list[SourcedResult], list[AgentError]]:
-    """
-    ★ Hub-and-Spoke: Coordinator が必要と判断した subagent だけを並列起動する。
-    サブエージェント同士は互いを知らない — Coordinator がオーケストレーションする。
-    """
-    # ★ なぜ並列実行か (--learn で表示)
     learn(
-        "なぜ並列実行か: 独立したタスクを並列化することで、合計実行時間を短縮できる",
+        "なぜ並列実行か: 独立した subagent を並列化することで待ち時間を短縮できる。",
         learn_mode,
     )
-
-    # ★ なぜハブ・アンド・スポークか (--learn で表示)
-    learn(
-        "なぜハブ・アンド・スポークか: サブエージェント間の直接通信は可観測性を下げる。"
-        "コーディネーター経由にすることで、エラーハンドリングと情報フローを一元管理できる",
-        learn_mode,
-    )
-
-    # 動的選択: requirements に基づいてタスクリストを構築
-    tasks = []
-    agent_names = []
+    tasks: list[asyncio.Future[Any] | Any] = []
+    agent_names: list[str] = []
 
     if requirements.needs_web_search:
         tasks.append(
             web_search_agent(
-                query=query,
-                client=client,
+                query_text=query_text,
                 simulate_timeout=simulate_all_fail or "web_search" in simulate_timeout_agents,
                 verbose=verbose,
                 learn_mode=learn_mode,
@@ -617,8 +495,7 @@ async def _dispatch_agents(
     if requirements.needs_doc_analysis:
         tasks.append(
             doc_analysis_agent(
-                query=query,
-                client=client,
+                query_text=query_text,
                 simulate_timeout=simulate_all_fail or "doc_analysis" in simulate_timeout_agents,
                 verbose=verbose,
                 learn_mode=learn_mode,
@@ -629,8 +506,7 @@ async def _dispatch_agents(
     if requirements.needs_knowledge_base:
         tasks.append(
             knowledge_base_agent(
-                query=query,
-                client=client,
+                query_text=query_text,
                 simulate_timeout=simulate_all_fail or "knowledge_base" in simulate_timeout_agents,
                 verbose=verbose,
                 learn_mode=learn_mode,
@@ -639,29 +515,24 @@ async def _dispatch_agents(
         agent_names.append("knowledge_base_agent")
 
     if not tasks:
-        # フォールバック: 全エージェントを起動
+        fallback = QueryRequirements(
+            needs_web_search=True,
+            needs_doc_analysis=True,
+            needs_knowledge_base=True,
+            reasoning="fallback: no agents selected",
+        )
         return await _dispatch_agents(
-            query=query,
-            client=client,
-            requirements=QueryRequirements(
-                needs_web_search=True,
-                needs_doc_analysis=True,
-                needs_knowledge_base=True,
-                reasoning="fallback: no agents selected",
-            ),
+            query_text=query_text,
+            requirements=fallback,
             simulate_timeout_agents=simulate_timeout_agents,
             simulate_all_fail=simulate_all_fail,
             verbose=verbose,
             learn_mode=False,
         )
 
-    # asyncio.gather: return_exceptions=True で partial failure を graceful に処理
     raw_results = await asyncio.gather(*tasks, return_exceptions=True)
-
-    # ────── Partial failure の処理 ──────
     successful: list[SourcedResult] = []
     failed: list[AgentError] = []
-
     for agent_name, result in zip(agent_names, raw_results):
         if isinstance(result, TimeoutError):
             failed.append(
@@ -679,7 +550,7 @@ async def _dispatch_agents(
             failed.append(
                 AgentError(
                     agent=agent_name,
-                    error_type="api_error",
+                    error_type="agent_execution_error",
                     message=str(result),
                     is_retryable=False,
                     failed_at=time.time(),
@@ -689,113 +560,63 @@ async def _dispatch_agents(
                 print(f"  [ERROR] {agent_name}: {result}")
         else:
             successful.append(result)
-
     return successful, failed
 
 
-# ────────────────────────────────────────────────
-# Coordinator
-# ────────────────────────────────────────────────
-
-
 async def research_coordinator(
-    query: str,
-    client: anthropic.Anthropic,
+    query_text: str,
     simulate_timeout_agents: list[str] | None = None,
     simulate_all_fail: bool = False,
     verbose: bool = True,
     learn_mode: bool = False,
     force_refinement: bool = False,
 ) -> ResearchResult:
-    """
-    Research Coordinator (Hub-and-Spoke)
-
-    ★ Hub-and-Spoke: このコーディネーターがハブ。
-      全ての subagent はスポーク。サブエージェント間の直接通信は存在しない。
-
-    設計のポイント:
-    1. 動的選択: Claude がクエリを分析してどの subagent を起動するか決定 (Task 1.2)
-    2. 並列委譲: asyncio.gather で選択された subagent を並列実行
-    3. Partial failure: 一部失敗しても処理継続
-    4. Structured error: エラーは AgentError で表現
-    5. Provenance: SourcedResult で情報源を追跡
-    6. 反復改善: synthesis のギャップを評価して再委譲 (Task 1.2)
-    """
     simulate_timeout_agents = simulate_timeout_agents or []
-
     if verbose:
-        print(f"\n[Coordinator] Starting research: {query}")
+        print(f"\n[Coordinator] Starting research: {query_text}")
 
-    # ────── Step 1: 動的クエリ分析 ──────
-    # ★ Coordinator が Claude を使って、どの subagent を起動するか決める
-    requirements = analyze_query_requirements(
-        query=query,
-        client=client,
+    requirements = await analyze_query_requirements(
+        query_text=query_text,
         verbose=verbose,
         learn_mode=learn_mode,
     )
-
     if verbose:
         print("[Coordinator] Dispatching to selected subagents in parallel...")
 
-    # ────── Step 2: 並列委譲 ──────
-    # ★ 各 subagent には query を明示的に渡す (暗黙の文脈継承に依存しない)
     successful, failed = await _dispatch_agents(
-        query=query,
-        client=client,
+        query_text=query_text,
         requirements=requirements,
         simulate_timeout_agents=simulate_timeout_agents,
         simulate_all_fail=simulate_all_fail,
         verbose=verbose,
         learn_mode=learn_mode,
     )
-
-    # 全エージェント失敗の場合は例外
     if not successful:
         raise RuntimeError(
-            f"All agents failed: {[f.agent for f in failed]}. "
-            f"Escalation required."
+            f"All agents failed: {[f.agent for f in failed]}. Escalation required."
         )
 
-    # ────── Step 3: 初回 Synthesis (provenance 付き) ──────
-    synthesis = synthesize_results(
-        query=query,
+    synthesis = await synthesize_results(
+        query_text=query_text,
         sources=successful,
-        client=client,
         verbose=verbose,
     )
-
     refinement_iterations = 0
-
-    # ────── Step 4: 反復改善ループ ──────
-    # Coordinator が synthesis を評価してギャップがあれば再委譲する
-    MAX_REFINEMENT_ITERATIONS = 1  # 無限ループ防止
-
-    coverage_eval = evaluate_synthesis_coverage(
-        query=query,
+    coverage_eval = await evaluate_synthesis_coverage(
+        query_text=query_text,
         synthesis=synthesis,
-        client=client,
         verbose=verbose,
         learn_mode=learn_mode,
     )
 
-    if (not coverage_eval.is_sufficient or force_refinement) and MAX_REFINEMENT_ITERATIONS > 0:
+    if (not coverage_eval.is_sufficient or force_refinement) and coverage_eval.targeted_queries:
         refinement_iterations += 1
-
         if verbose:
             print(f"\n[Coordinator] Refinement iteration {refinement_iterations}: re-delegating...")
-
-        # ギャップを補完するための targeted_queries で再委譲
-        # ★ Hub-and-Spoke: 再委譲も Coordinator 経由
         any_extra = False
-        for targeted_query in coverage_eval.targeted_queries[:2]:  # 最大2クエリで補完
-            if verbose:
-                print(f"  [Coordinator] Targeted re-delegation: {targeted_query}")
-
+        for targeted_query in coverage_eval.targeted_queries[:2]:
             extra_successful, extra_failed = await _dispatch_agents(
-                query=targeted_query,
-                client=client,
-                # 再委譲では web_search と knowledge_base を使う (ギャップ補完のため)
+                query_text=targeted_query,
                 requirements=QueryRequirements(
                     needs_web_search=True,
                     needs_doc_analysis=False,
@@ -805,27 +626,22 @@ async def research_coordinator(
                 simulate_timeout_agents=simulate_timeout_agents,
                 simulate_all_fail=simulate_all_fail,
                 verbose=verbose,
-                learn_mode=False,  # 反復時は learn ノートを重複表示しない
+                learn_mode=False,
             )
-
             successful.extend(extra_successful)
             failed.extend(extra_failed)
             if extra_successful:
                 any_extra = True
-
         if any_extra:
-            synthesis = synthesize_results(
-                query=query,
+            synthesis = await synthesize_results(
+                query_text=query_text,
                 sources=successful,
-                client=client,
                 verbose=verbose,
             )
 
-    # overall confidence: 成功したエージェントの最低信頼度
-    overall_confidence = min(s.confidence for s in successful)
-
+    overall_confidence = min(source.confidence for source in successful)
     return ResearchResult(
-        query=query,
+        query=query_text,
         synthesis=synthesis,
         sources_used=successful,
         sources_failed=failed,
@@ -835,28 +651,18 @@ async def research_coordinator(
     )
 
 
-# ────────────────────────────────────────────────
-# Demo: Dynamic Selection Comparison
-# ────────────────────────────────────────────────
-
-
-def show_dynamic_selection_demo(client: anthropic.Anthropic) -> None:
-    """
-    --show-dynamic-selection: 異なるクエリに対して動的選択がどう変わるかを示す
-    """
+async def show_dynamic_selection_demo() -> None:
     demo_queries = [
-        "最新の Claude API の料金は？",           # web_search が必要
-        "社内の API 利用ガイドラインを確認したい",  # doc_analysis が必要
-        "よくある質問: API キーの管理方法",         # knowledge_base が必要
+        "最新の Claude API の料金は？",
+        "社内の API 利用ガイドラインを確認したい",
+        "よくある質問: API キーの管理方法",
     ]
-
-    print(f"\n{'='*60}")
+    print(f"\n{'=' * 60}")
     print("Dynamic Selection Demo: クエリごとに選択される subagent が変わる")
-    print(f"{'='*60}")
-
-    for q in demo_queries:
-        print(f"\nクエリ: {q}")
-        reqs = analyze_query_requirements(query=q, client=client, verbose=False)
+    print(f"{'=' * 60}")
+    for query_text in demo_queries:
+        print(f"\nクエリ: {query_text}")
+        reqs = await analyze_query_requirements(query_text=query_text, verbose=False)
         selected = [
             name
             for name, needed in [
@@ -869,16 +675,9 @@ def show_dynamic_selection_demo(client: anthropic.Anthropic) -> None:
         print(f"  → 選択された subagent: {selected}")
         print(f"  → 理由: {reqs.reasoning}")
 
-    print()
 
-
-# ────────────────────────────────────────────────
-# Main
-# ────────────────────────────────────────────────
-
-
-def main():
-    parser = argparse.ArgumentParser(description="Multi-Agent Research Pipeline Lab")
+async def main() -> None:
+    parser = argparse.ArgumentParser(description="Multi-Agent Research Pipeline Lab (Claude Agent SDK)")
     parser.add_argument("--query", default="Claude Code の plan mode の使い方")
     parser.add_argument(
         "--simulate-timeout",
@@ -896,7 +695,7 @@ def main():
     parser.add_argument(
         "--learn",
         action="store_true",
-        help="各設計決定の教育ノート (🎓 [LEARN]) を表示する",
+        help="各設計決定の教育ノートを表示する",
     )
     parser.add_argument(
         "--show-dynamic-selection",
@@ -911,69 +710,60 @@ def main():
     parser.add_argument("--quiet", action="store_true")
     args = parser.parse_args()
 
-    client = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY"))
-
-    # ────── Dynamic Selection Demo ──────
     if args.show_dynamic_selection:
-        show_dynamic_selection_demo(client)
+        await show_dynamic_selection_demo()
         return
 
-    print(f"\n{'='*60}")
+    print(f"\n{'=' * 60}")
     print(f"調査クエリ: {args.query}")
     if args.simulate_timeout:
         print(f"タイムアウトシミュレーション: {args.simulate_timeout}")
     if args.simulate_all_fail:
         print("全エージェント失敗シミュレーション")
     if args.learn:
-        print("学習モード: ON (🎓 [LEARN] ノートを表示)")
+        print("学習モード: ON")
     if args.show_refinement:
-        print("反復改善デモ: ON (強制的に refinement を実行)")
-    print(f"{'='*60}")
+        print("反復改善デモ: ON")
+    print(f"{'=' * 60}")
 
     try:
-        result = asyncio.run(
-            research_coordinator(
-                query=args.query,
-                client=client,
-                simulate_timeout_agents=args.simulate_timeout,
-                simulate_all_fail=args.simulate_all_fail,
-                verbose=not args.quiet,
-                learn_mode=args.learn,
-                force_refinement=args.show_refinement,
-            )
+        result = await research_coordinator(
+            query_text=args.query,
+            simulate_timeout_agents=args.simulate_timeout,
+            simulate_all_fail=args.simulate_all_fail,
+            verbose=not args.quiet,
+            learn_mode=args.learn,
+            force_refinement=args.show_refinement,
         )
-
-        print(f"\n{'='*60}")
+        print(f"\n{'=' * 60}")
         print("調査結果:")
-        print(f"{'='*60}")
+        print(f"{'=' * 60}")
         print(result.synthesis)
 
-        print(f"\n{'='*60}")
+        print(f"\n{'=' * 60}")
         print("メタデータ:")
-        print(f"{'='*60}")
+        print(f"{'=' * 60}")
         print(f"全体信頼度: {result.overall_confidence:.0%}")
         print(f"部分的失敗: {result.is_partial}")
         print(f"反復改善回数: {result.refinement_iterations}")
         print(f"成功エージェント: {[s.agent for s in result.sources_used]}")
-
         if result.sources_failed:
             print(f"失敗エージェント: {[f.agent for f in result.sources_failed]}")
-            print("失敗詳細:")
             for err in result.sources_failed:
                 print(
                     f"  - {err.agent}: [{err.error_type}] {err.message} "
                     f"(retryable: {err.is_retryable})"
                 )
-
-        print(f"\n情報源:")
-        for src in result.sources_used:
-            print(f"  - {src.source} (信頼度: {src.confidence:.0%}, エージェント: {src.agent})")
-
-    except RuntimeError as e:
-        print(f"\n[ESCALATION REQUIRED]")
-        print(f"全エージェントが失敗しました: {e}")
+        print("\n情報源:")
+        for source in result.sources_used:
+            print(
+                f"  - {source.source} (信頼度: {source.confidence:.0%}, エージェント: {source.agent})"
+            )
+    except RuntimeError as error:
+        print("\n[ESCALATION REQUIRED]")
+        print(f"全エージェントが失敗しました: {error}")
         print("人間によるレビューが必要です。")
 
 
 if __name__ == "__main__":
-    main()
+    anyio.run(main)

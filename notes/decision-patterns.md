@@ -78,11 +78,11 @@ NO → orchestrator が明示的に渡す
 ```
 「JSON の構造を保証する必要があるか？」
 
-YES → tool_use + tool_choice: specific
+YES → Agent SDK の custom tool / output_format、または Claude API の tool_use + tool_choice
 「ツール呼び出しが必要なのか、出力フォーマットだけが必要なのか？」
-出力フォーマットのみ → tool_choice: tool (JSON 強制)
-任意のツール → tool_choice: any
-モデルに委ねる → tool_choice: auto
+構造化データを tool call として扱いたい → custom tool
+出力フォーマットだけ保証したい → output_format (json_schema)
+Claude API を直接使う → tool_choice: tool / any / auto を選ぶ
 ```
 
 ---

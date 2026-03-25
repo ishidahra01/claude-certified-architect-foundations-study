@@ -3,6 +3,9 @@
 **テーマ**: CLAUDE.md 階層 / rules / skills / MCP / plan mode  
 **カバードメイン**: Domain 3 (Claude Code Configuration & Workflows)
 
+> この Lab は **Claude Agent SDK でアプリを実装する Lab 01 / 03 / 04 / 05** を補完する位置づけです。  
+> ここでは runtime 実装ではなく、**Claude Code の設定・チーム運用・MCP 接続**に焦点を当てます。
+
 ## 学習目標
 
 1. CLAUDE.md の 3 層階層（global / project / subdir）を理解する

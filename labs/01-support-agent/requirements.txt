@@ -1,3 +1,3 @@
-anthropic
+claude-agent-sdk
+anyio
 python-dotenv
-jsonschema

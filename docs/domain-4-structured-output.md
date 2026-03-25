@@ -78,9 +78,30 @@ schema = {
 }
 ```
 
-## 3. `tool_use` + `tool_choice` による structured output
+## 3. structured output の実装パターン
 
-### tool_choice で JSON 出力を強制する
+> 試験対策では **Claude Agent SDK が第一選択**、`tool_use` / `tool_choice` はその下位の Claude API レイヤーとして理解する。
+
+### Agent SDK での第一選択: custom tool / `output_format`
+
+```python
+options = ClaudeAgentOptions(
+    output_format={"type": "json_schema", "schema": schema},
+)
+
+async for message in query(
+    prompt="請求書テキストを分析して structured output を返してください",
+    options=options,
+):
+    ...
+```
+
+- **出力フォーマットだけ保証したい**なら `output_format`
+- **構造化データを tool call として扱いたい**なら Agent SDK の custom tool を使う
+
+### Claude API レイヤー: `tool_use` + `tool_choice`
+
+### `tool_choice` で JSON 出力を強制する
 
 ```python
 import anthropic

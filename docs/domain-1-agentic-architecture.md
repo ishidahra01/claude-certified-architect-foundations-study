@@ -403,20 +403,26 @@ subagent_result = {
 }
 ```
 
-### AgentDefinition の設定
+### AgentDefinition / ClaudeAgentOptions の設定
 
 ```python
-# サブエージェントの設定例（AgentDefinition相当）
-subagent_definition = {
-    "name": "market_research_agent",
-    "description": "特定地域の市場データを調査・分析する専門エージェント",
-    "system_prompt": """あなたは市場調査の専門家です。
-    与えられたスコープ内のデータのみを調査し、
-    全ての発見事項に出典（URL、文書名、ページ番号）を付けてください。
-    スコープ外のトピックには踏み込まないでください。""",
-    "allowed_tools": ["web_search", "read_document"],  # Task は含めない（サブエージェントはサブエージェントを起動しない）
-    "max_tokens": 4096,
-}
+from claude_agent_sdk import AgentDefinition, ClaudeAgentOptions
+
+options = ClaudeAgentOptions(
+    agents={
+        "market-research-agent": AgentDefinition(
+            description="特定地域の市場データを調査・分析する専門エージェント",
+            prompt=(
+                "あなたは市場調査の専門家です。"
+                "与えられたスコープ内のデータのみを調査し、"
+                "全ての発見事項に出典（URL、文書名、ページ番号）を付けてください。"
+                "スコープ外のトピックには踏み込まないでください。"
+            ),
+            tools=["Read", "Grep", "WebSearch"],
+            model="sonnet",
+        ),
+    },
+)
 ```
 
 ---
@@ -557,19 +563,47 @@ def create_handoff_summary(
 
 ---
 
-## Task 1.5: Agent SDK Hooks によるツール呼び出しインターセプション
+## Task 1.5: Agent SDK / Claude Code Hooks によるツール呼び出しインターセプション
 
 ### なぜ重要か
 
 フックは**決定論的な保証**を提供します。プロンプト指示はモデルが従わない可能性がありますが、フックはコードレベルで強制されるため失敗率はゼロです。異なるソースからの異種データ形式の正規化や、ポリシー違反アクションのブロックに不可欠です。
 
-> **重要**: Claude Code Agent SDK のフックは、Python 関数を自前実装して呼び出すものではありません。  
-> `.claude/settings.json` に設定を書き、Claude Code が**自動的にシェルスクリプト/コマンドを実行**する仕組みです。  
-> 詳細: https://platform.claude.com/docs/en/agent-sdk/hooks
+> **重要**: 試験で出てくる「hooks」には **2つの文脈** があります。  
+> - **Claude Agent SDK**: `ClaudeAgentOptions(hooks=...)` に **Python callback** を登録する  
+> - **Claude Code**: `.claude/settings.json` に **command hook** を登録し、shell script / command を実行する
 
-### SDK フックの仕組み
+### Claude Agent SDK の Python hooks
 
-Claude Code Agent SDK のフックは、**設定ファイルに登録した外部コマンド**がエージェントのライフサイクルの各ポイントで自動実行されます。
+```python
+from claude_agent_sdk import ClaudeAgentOptions
+from claude_agent_sdk.types import HookMatcher
+
+options = ClaudeAgentOptions(
+    hooks={
+        "PreToolUse": [
+            HookMatcher(
+                matcher="mcp__support__process_refund",
+                hooks=[pre_tool_use_refund_check],
+            )
+        ],
+        "PostToolUse": [
+            HookMatcher(
+                matcher="mcp__support__lookup_order|mcp__support__process_refund",
+                hooks=[post_tool_use_audit_and_normalize],
+            )
+        ],
+    },
+)
+```
+
+- **PreToolUse**: 実行前に allow / deny を返せるため、ポリシー強制に向く
+- **PostToolUse**: 監査ログ、出力正規化、追加コンテキスト注入に向く
+- Lab 01 ではこの Python hooks パターンを採用している
+
+### Claude Code hooks の仕組み
+
+Claude Code の hooks は、**設定ファイルに登録した外部コマンド**がエージェントのライフサイクルの各ポイントで自動実行されます。
 
 ```
 ツール呼び出し要求
@@ -692,17 +726,17 @@ exit 0
 
 ### フック vs プロンプト指示の比較
 
-| | プロンプト指示 | SDK フック |
+| | プロンプト指示 | Hook |
 |---|---|---|
 | **コンプライアンス** | 確率的（失敗あり） | 決定論的（必ず実行） |
-| **実装方法** | システムプロンプト | `.claude/settings.json` + スクリプト |
+| **実装方法** | システムプロンプト | Agent SDK: Python callback / Claude Code: `.claude/settings.json` + スクリプト |
 | **適用タイミング** | モデルが解釈する時 | ツール呼び出しの前後（コードレベル） |
 | **用途** | スタイル・ヒューリスティック | セキュリティ・監査・変換 |
 
 ### フックの選択基準まとめ
 
 ```
-SDK フックを使う場合:
+Hook を使う場合:
   ✅ 返金額の上限チェック（決定論的保証が必要）
   ✅ 監査ログの記録（全ツール呼び出しを漏れなく記録）
   ✅ レート制限・スロットリング

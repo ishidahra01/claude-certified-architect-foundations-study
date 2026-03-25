@@ -78,9 +78,9 @@ Prompts  → ユーザーが選択するテンプレート (ワークフロー�
 - **`.claude/skills/`**: `context: fork` による権限制御
 - **plan mode vs direct execution**: 安全な探索と複雑変更の設計
 - **CI での `-p` と structured output**: 自動化パイプライン
-- **Hooks**: PreToolUse / PostToolUse でのセキュリティポリシー強制
+- **Hooks**: Claude Code では `.claude/settings.json`、Agent SDK では Python callback で実装
 - **カスタムスラッシュコマンド**: 再利用可能なタスク自動化
-- **SDK による自動化**: GitHub Actions との統合
+- **SDK による自動化**: Claude Code SDK / Agent SDK を使った自動化
 
 ### CLAUDE.md 階層優先順位
 
@@ -99,13 +99,16 @@ Notification → 通知イベント (Slack通知)
 Stop        → セッション終了 (クリーンアップ)
 ```
 
+> 補足: **Claude Code** では `.claude/settings.json` + command hook、  
+> **Claude Agent SDK** では `ClaudeAgentOptions(hooks=...)` に Python callback を登録する。
+
 ## Domain 4: Prompt Engineering & Structured Output (20%)
 
 ### 主要テーマ
 
 - **システムプロンプト設計**: 役割・制約・スタイルの構造化
 - **JSON schema 設計**: nullable/optional の使い分け
-- **`tool_use` + `tool_choice`**: structured output の強制
+- **structured output の強制**: Agent SDK の custom tool / `output_format`、または API の `tool_use` + `tool_choice`
 - **semantic validation**: calculated_total vs stated_total
 - **validation-retry ループ**: エラー時の自動再試行
 - **few-shot examples**: フォーマット制御

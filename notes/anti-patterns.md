@@ -178,27 +178,29 @@ Code / Gate: ビジネスルールの deterministic な強制
 
 ---
 
-## AP-08: tool_choice: auto で structured output を強制しようとする
+## AP-08: structured output の方式を取り違える
 
 ### ❌ アンチパターン
 
 ```python
-# JSON で返してほしいが tool_choice は auto のまま
-response = client.messages.create(
-    tools=[extract_schema],
-    tool_choice={"type": "auto"},  # モデルが tool を使わないことがある
-    messages=[...]
-)
+# Agent SDK なのに、下位 API の tool_choice だけを唯一の正解だと思い込む
+# あるいは Claude API なのに auto のままで structured output を期待する
 ```
 
 ### ✅ 正しいパターン
 
 ```python
+# Agent SDK:
+options = ClaudeAgentOptions(
+    output_format={"type": "json_schema", "schema": schema},
+)
+
+# Claude API:
 response = client.messages.create(
     tools=[extract_schema],
-    tool_choice={"type": "tool", "name": "extract_invoice"},  # 必ず呼び出す
-    messages=[...]
+    tool_choice={"type": "tool", "name": "extract_invoice"},
+    messages=[...],
 )
 ```
 
-**なぜ NG か**: `tool_choice: auto` では、モデルがツールを呼び出さず自然言語で回答する可能性があります。structured output を確実に取得するには specific tool を指定する必要があります。
+**なぜ NG か**: structured output には複数の実装レイヤーがあります。Agent SDK なら `output_format` や custom tool、Claude API なら `tool_choice` を使い分ける必要があります。`tool_choice: auto` のままでは、API レイヤーでは自然言語応答に逃げる可能性があります。

@@ -22,7 +22,7 @@
 
 ## 役割
 このプロジェクトは顧客サポートエージェントです。
-Anthropic SDK for Python を使用します。
+Claude Agent SDK を中心に使用し、必要に応じて Claude API / Claude Code / MCP を併用します。
 
 ## コーディング規約
 - Python 3.11+

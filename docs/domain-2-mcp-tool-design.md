@@ -21,6 +21,27 @@ LLM はツール選択を **description だけ** を根拠に行います。
 | **エラー戻り値** | モデルがエラー後の行動を選択できる | "注文が存在しない場合は isError: true" |
 | **依存関係** | 他ツールとの呼び出し順序を保証する | "lookup_order より先に get_customer を呼ぶ" |
 
+### Agent SDK でのツール定義
+
+Claude Agent SDK では、上記の設計原則を **`@tool` decorator + `create_sdk_mcp_server()`** で実装します。
+
+```python
+from claude_agent_sdk import create_sdk_mcp_server, tool
+
+@tool(
+    "lookup_order",
+    "注文IDで注文情報を取得します。返金申請の前に必ず呼び出してください。",
+    {"order_id": str},
+)
+async def lookup_order_tool(args):
+    ...
+
+server = create_sdk_mcp_server(name="orders", tools=[lookup_order_tool])
+```
+
+- Agent SDK でも重要なのは decorator 自体ではなく **description の質**
+- dict ベースの tool 定義でも `@tool` でも、設計原則は同じ
+
 ```python
 # NG: 目的も入力形式も不明な description
 {

@@ -119,20 +119,18 @@ def synthesis_agent(query: str, sources: list[SourcedResult]) -> dict:
         if not s.get("error")  # エラー結果は除外
     ])
     
-    response = client.messages.create(
-        model="claude-opus-4-5",
-        messages=[{
-            "role": "user",
-            "content": f"以下の情報を統合して回答してください:\n\n{context}\n\n質問: {query}"
-        }]
+    result = run_agent_sdk_query(
+        prompt=f"以下の情報を統合して回答してください:\n\n{context}\n\n質問: {query}"
     )
-    
+
     return {
-        "answer": response.content[0].text,
+        "answer": result,
         "sources_used": [s.source for s in sources if not s.get("error")],
         "sources_failed": [s.agent for s in sources if s.get("error")]
     }
 ```
+
+> 実装では Claude Agent SDK の `query()` / `ClaudeSDKClient` を使うことが多いが、重要なのは **provenance を保ったまま synthesis する設計** であり、下位 API を直接叩くことではない。
 
 ## 4. Escalation の設計
 

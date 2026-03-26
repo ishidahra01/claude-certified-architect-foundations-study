@@ -89,10 +89,27 @@ class SynthesisCoverageEval:
 
 
 MOCK_WEB_RESULTS = {
+    "plan_mode": {
+        "keywords": ["plan mode", "claude code"],
+        "summary": (
+            "Claude Code の公式 common workflows では、Plan Mode は read-only 操作で"
+            "コードベースを分析し、計画を提案するためのモードとして説明されている。"
+            "セッション中は Shift+Tab で切り替え、新規セッションは"
+            " `claude --permission-mode plan` で開始できる。"
+        ),
+        "url": "https://code.claude.com/docs/en/common-workflows#use-plan-mode-for-safe-code-analysis",
+        "relevance": 0.97,
+        "notes": [
+            "Shift+Tab で permission mode を切り替えると Plan Mode に入れる",
+            "新規セッションは claude --permission-mode plan で開始できる",
+            "Plan Mode は read-only でコードベースを分析して計画を提案する",
+        ],
+    },
     "default": {
-        "summary": "Web 検索により関連する最新情報を取得しました。",
-        "url": "https://example.com/article",
-        "relevance": 0.85,
+        "summary": "この lab には該当クエリに対応する curated web evidence がありません。",
+        "url": "mock://web/no-curated-match",
+        "relevance": 0.15,
+        "notes": ["追加の evidence がないため、確実な要約はできない"],
     }
 }
 
@@ -105,10 +122,20 @@ MOCK_DOCS = {
 }
 
 MOCK_KB = {
+    "plan_mode": {
+        "keywords": ["plan mode", "claude code"],
+        "content": (
+            "内部ナレッジ要約: Claude Code の Plan Mode は、安全に事前調査や計画立案を行う用途に向く。"
+            "既定モードは .claude/settings.json の permissions.defaultMode で plan に設定でき、"
+            "plan file の保存先は settings の plansDirectory で調整できる。"
+        ),
+        "kb_id": "KB-CLAUDE-CODE-PLAN-MODE",
+        "relevance": 0.91,
+    },
     "default": {
-        "content": "ナレッジベースから既知の情報を取得しました。",
-        "kb_id": "KB-ARCH-001",
-        "relevance": 0.75,
+        "content": "この lab には該当クエリに対応する curated knowledge-base entry がありません。",
+        "kb_id": "KB-NO-CURATED-MATCH",
+        "relevance": 0.15,
     }
 }
 
@@ -181,6 +208,9 @@ def build_subagent_prompt(query_text: str, evidence_label: str, evidence_body: s
         f"利用可能な入力 ({evidence_label}):\n{evidence_body}\n\n"
         "与えられた情報だけを使って調査結果をまとめてください。"
         "推測や新しい外部情報の追加は禁止です。"
+        "入力に直接書かれていない事実は出力しないでください。"
+        "質問に答える根拠が不足している場合は、その旨を明示し、"
+        "confidence を 0.3 以下にしてください。"
     )
 
 
@@ -201,7 +231,41 @@ def build_synthesis_prompt(query_text: str, sources: list[SourcedResult]) -> str
         "情報源コンテンツ:\n"
         + "\n\n".join(contents)
         + "\n\n出典と不確実性を反映しながら統合回答を作成してください。"
+        + "情報源に直接書かれていない事実は追加せず、根拠不足なら不足と明示してください。"
     )
+
+
+def select_curated_entry(query_text: str, catalog: dict[str, dict[str, Any]]) -> dict[str, Any]:
+    normalized_query = query_text.lower()
+    for key, entry in catalog.items():
+        if key == "default":
+            continue
+        keywords = entry.get("keywords", [])
+        if all(keyword.lower() in normalized_query for keyword in keywords):
+            return entry
+    return catalog["default"]
+
+
+def normalize_sources(sources: list[SourcedResult]) -> list[SourcedResult]:
+    best_by_source: dict[tuple[str, str], SourcedResult] = {}
+    for source in sources:
+        signature = (source.agent, source.source)
+        existing = best_by_source.get(signature)
+        if existing is None or source.confidence > existing.confidence:
+            best_by_source[signature] = source
+
+    normalized = list(best_by_source.values())
+    has_curated_source = any(
+        source.source not in {"mock://web/no-curated-match", "kb://KB-NO-CURATED-MATCH"}
+        for source in normalized
+    )
+    if has_curated_source:
+        normalized = [
+            source
+            for source in normalized
+            if source.source not in {"mock://web/no-curated-match", "kb://KB-NO-CURATED-MATCH"}
+        ]
+    return sorted(normalized, key=lambda source: (source.agent, source.source))
 
 
 def build_coverage_prompt(query_text: str, synthesis: str) -> str:
@@ -209,6 +273,15 @@ def build_coverage_prompt(query_text: str, synthesis: str) -> str:
         f"調査クエリ: {query_text}\n\n"
         f"現在の synthesis:\n{synthesis}\n\n"
         "カバレッジの不足があるか評価し、必要なら targeted query を提案してください。"
+    )
+
+
+def build_schema_repair_prompt(original_prompt: str, response_text: str) -> str:
+    return (
+        "以下の応答を、指定された JSON schema に合う structured output に正規化してください。"
+        "与えられたテキストだけを使い、推測や新情報の追加は禁止です。\n\n"
+        f"元の依頼:\n{original_prompt}\n\n"
+        f"変換対象の応答:\n{response_text}"
     )
 
 
@@ -222,11 +295,13 @@ async def run_query_with_schema(
     agent_description: str | None = None,
     agent_prompt: str | None = None,
     agent_model: str = "haiku",
+    allow_repair: bool = True,
 ) -> dict[str, Any]:
     agents = None
     final_prompt = prompt
     context = label or agent_name or "unknown operation"
     should_log_text = verbose and label is not None
+    assistant_text_blocks: list[str] = []
     if agent_name and agent_description and agent_prompt:
         agents = {
             agent_name: AgentDefinition(
@@ -248,7 +323,12 @@ async def run_query_with_schema(
         if isinstance(message, AssistantMessage) and should_log_text:
             for block in message.content:
                 if isinstance(block, TextBlock):
+                    assistant_text_blocks.append(block.text)
                     print(f"  [{label}] {block.text}")
+        elif isinstance(message, AssistantMessage):
+            for block in message.content:
+                if isinstance(block, TextBlock):
+                    assistant_text_blocks.append(block.text)
         elif isinstance(message, ResultMessage):
             result_message = message
 
@@ -257,6 +337,21 @@ async def run_query_with_schema(
     if result_message.is_error:
         raise RuntimeError(result_message.result or f"Claude Agent SDK query failed ({context})")
     if result_message.structured_output is None:
+        fallback_parts = []
+        if result_message.result:
+            fallback_parts.append(result_message.result)
+        fallback_parts.extend(assistant_text_blocks)
+        fallback_text = "\n\n".join(part.strip() for part in fallback_parts if part and part.strip())
+        if allow_repair and fallback_text:
+            if verbose:
+                print(f"  [{context}] Structured output missing. Retrying normalization...")
+            return await run_query_with_schema(
+                prompt=build_schema_repair_prompt(prompt, fallback_text),
+                schema=schema,
+                verbose=verbose,
+                label=f"{context}-repair",
+                allow_repair=False,
+            )
         raise RuntimeError("Structured output was not returned")
     return result_message.structured_output
 
@@ -383,14 +478,19 @@ async def web_search_agent(
     verbose: bool = True,
     learn_mode: bool = False,
 ) -> SourcedResult:
-    mock_result = MOCK_WEB_RESULTS["default"]
+    mock_result = select_curated_entry(query_text, MOCK_WEB_RESULTS)
+    notes = "\n".join(f"- {note}" for note in mock_result.get("notes", []))
     return await run_subagent(
         agent_name="web-researcher",
         agent_description="Summarizes web findings with provenance and caveats.",
         agent_prompt="You are a web research specialist. Use only the provided evidence. Include caveats when confidence is low.",
         query_text=query_text,
         evidence_label="web result",
-        evidence_body=f"URL: {mock_result['url']}\nSummary: {mock_result['summary']}",
+        evidence_body=(
+            f"URL: {mock_result['url']}\n"
+            f"Summary: {mock_result['summary']}\n"
+            f"Notes:\n{notes}"
+        ),
         source_url=mock_result["url"],
         default_confidence=mock_result["relevance"],
         simulate_timeout=simulate_timeout,
@@ -429,7 +529,7 @@ async def knowledge_base_agent(
     verbose: bool = True,
     learn_mode: bool = False,
 ) -> SourcedResult:
-    mock_kb = MOCK_KB["default"]
+    mock_kb = select_curated_entry(query_text, MOCK_KB)
     return await run_subagent(
         agent_name="knowledge-base-specialist",
         agent_description="Finds reusable internal knowledge for the given query.",
@@ -591,6 +691,7 @@ async def research_coordinator(
         verbose=verbose,
         learn_mode=learn_mode,
     )
+    successful = normalize_sources(successful)
     if not successful:
         raise RuntimeError(
             f"All agents failed: {[f.agent for f in failed]}. Escalation required."
@@ -632,6 +733,7 @@ async def research_coordinator(
             failed.extend(extra_failed)
             if extra_successful:
                 any_extra = True
+        successful = normalize_sources(successful)
         if any_extra:
             synthesis = await synthesize_results(
                 query_text=query_text,
@@ -639,6 +741,7 @@ async def research_coordinator(
                 verbose=verbose,
             )
 
+    successful = normalize_sources(successful)
     overall_confidence = min(source.confidence for source in successful)
     return ResearchResult(
         query=query_text,

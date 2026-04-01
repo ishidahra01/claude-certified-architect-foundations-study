@@ -35,6 +35,12 @@ claude-certified-architect-foundations-study/
     03-structured-extraction/           # Claude Agent SDK: Structured extraction + validation-retry
     04-multi-agent-research/            # Coordinator / subagent / provenance
     05-tool-design-mcp/                 # Tool design / MCP integration / built-in tools
+  prep-exercises/
+    01-multi-tool-agent.ipynb           # 準備演習 01: 段階実行 Notebook
+    02-claude-code-configuration.ipynb  # 準備演習 02: 設定観察 Notebook
+    03-structured-extraction.ipynb      # 準備演習 03: Structured extraction Notebook
+    04-multi-agent-research.ipynb       # 準備演習 04: Multi-agent research Notebook
+    README.md                           # Notebook と Lab の対応表
   notes/
     decision-patterns.md                # 設計判断パターン集
     anti-patterns.md                    # アンチパターン集
@@ -83,6 +89,28 @@ Agent SDK での `@tool` / `create_sdk_mcp_server()` と合わせて、
 description 設計・構造化エラー・`.mcp.json`・組み込みツールの使い分けを学びます。
 
 → [labs/05-tool-design-mcp/](labs/05-tool-design-mcp/)
+
+## 準備演習 Notebook 一覧
+
+試験ガイドの「準備演習」は、完成済みの `labs/` をそのまま分解するのではなく、
+**Notebook 上で上から順にセルを実行しながら理解を積み上げる教材** として
+`prep-exercises/` に切り出しています。
+
+- Notebook は **手順 + コード + 解説 + 確認ポイント** を 1 ファイルにまとめた学習用コンテンツ
+- `labs/` は CLI や補助コードを含む **reference implementation**
+- Notebook の最終状態は `labs/` と完全一致しなくてもよく、設計意図の理解と橋渡しを優先
+- Claude Code 設定演習を除き、Notebook の実装方針は **Claude Agent SDK ベース**
+- 具体的な API や推奨パターンは、**最新の公式ドキュメント** と対応する `labs/` を参照して更新してよい
+
+| 準備演習 | Notebook | 対応 Lab | 学習の焦点 |
+|---|---|---|---|
+| 01 | [prep-exercises/01-multi-tool-agent.ipynb](prep-exercises/01-multi-tool-agent.ipynb) | [labs/01-support-agent/](labs/01-support-agent/) | ツール定義 / `stop_reason` / structured error / escalation |
+| 02 | [prep-exercises/02-claude-code-configuration.ipynb](prep-exercises/02-claude-code-configuration.ipynb) | [labs/02-claude-code-team-workflow/](labs/02-claude-code-team-workflow/) | `CLAUDE.md` 階層 / rules / skills / slash command / MCP / plan mode |
+| 03 | [prep-exercises/03-structured-extraction.ipynb](prep-exercises/03-structured-extraction.ipynb) | [labs/03-structured-extraction/](labs/03-structured-extraction/) | schema / validation-retry / batch strategy / human review |
+| 04 | [prep-exercises/04-multi-agent-research.ipynb](prep-exercises/04-multi-agent-research.ipynb) | [labs/04-multi-agent-research/](labs/04-multi-agent-research/) | coordinator / subagent / parallelism / provenance / partial failure |
+
+最初にどれを開くべきか迷ったら、目的に合う Notebook から開始し、最後に対応する Lab を読んで
+「教材用の最小構成」と「完成版の整理された実装」の差分を確認してください。
 
 ## 参考リンク
 
